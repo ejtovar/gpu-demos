@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>GPU fluid demos</title>
+<meta name="theme-color" content="#1c2522">
+<link rel="icon" type="image/png" href="supersonic/icon-192.png">
+<style>
+  :root { --bg: #e7ece7; --panel: #f5f7f4; --ink: #1c2925; --muted: #56665f; --line: #c7d1ca; --accent: #245f9f; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #141b19; --panel: #1c2522; --ink: #e2e9e5; --muted: #93a39c; --line: #33413b; --accent: #72a9df; } }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding: max(1.5rem, env(safe-area-inset-top)) 16px max(1.5rem, env(safe-area-inset-bottom)); }
+  main { max-width: 40rem; margin: 0 auto; }
+  h1 { font-size: 1.5rem; margin: 0 0 0.25rem; }
+  a { color: var(--accent); }
+  p.lead { color: var(--muted); margin: 0 0 1.5rem; }
+  a.app { display: flex; gap: 1rem; align-items: center; padding: 1rem; margin-bottom: 0.9rem; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 14px; color: inherit; text-decoration: none; }
+  a.app:hover, a.app:focus-visible { border-color: var(--accent); outline: none; }
+  a.app img { width: 72px; height: 72px; border-radius: 16px; flex: none; }
+  a.app h2 { margin: 0; font-size: 1.15rem; }
+  a.app p { margin: 0.15rem 0 0; color: var(--muted); font-size: 0.92rem; }
+  .note { color: var(--muted); font-size: 0.88rem; border-top: 1px solid var(--line); padding-top: 1rem; margin-top: 1.5rem; }
+  .note b { color: var(--ink); }
+</style>
+</head>
+<body>
+<main>
+  <h1>GPU fluid demos</h1>
+  <p class="lead">Two finite element solvers from <a href="https://github.com/conservation-laws/ryujin">ryujin</a>, ported to WebGPU. They run entirely on your device's GPU.</p>
+  <a class="app" href="runoff/"><img src="runoff/icon-192.png" alt=""><div><h2>Runoff</h2><p>Flash floods on your GPU: ryujin shallow water in the browser.</p></div></a>
+  <a class="app" href="supersonic/"><img src="supersonic/icon-192.png" alt=""><div><h2>Supersonic</h2><p>Drag a cylinder through a Mach 3 stream: ryujin Euler in the browser.</p></div></a>
+  <div class="note">
+    <p><b>Install on a phone:</b> open an app, then on iPhone tap Share → <i>Add to Home Screen</i>; on Android tap the menu → <i>Install app</i>. It then opens full screen, like an app, and works offline.</p>
+    <p><b>Needs WebGPU:</b> Safari 26 or newer on iPhone and iPad, Chrome or Edge on Android and desktop.</p>
+  </div>
+</main>
+</body>
+</html>
