@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Supersonic: ryujin Euler on WebGPU</title>
-<meta name="description" content="A Mach 3 flow past a cylinder you can drag around, computed on your GPU with a WebGPU port of ryujin's Euler solver.">
+<meta name="description" content="A Mach 3 flow past a cylinder, wedge or airfoil you can drag and rotate, computed on your GPU with a WebGPU port of ryujin's Euler solver.">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Supersonic">
@@ -19,10 +19,12 @@
   cfl: f32, evc: f32, relaxFactor: f32, newtonTol: f32,
   omegaInv: f32, p1: f32, p2: f32, p3: f32,
   inflow: vec4f,  /* conserved Dirichlet state (rho, m_x, m_y, E) */
-  body: vec4f,    /* cylinder (center x, center y, radius, enabled) */
-  bodyVel: vec4f, /* cylinder velocity (v_x, v_y, 0, 0) */
+  body: vec4f,    /* body (center x, center y, size r, enabled) */
+  bodyVel: vec4f, /* body velocity (v_x, v_y, angular velocity omega, 0) */
   vtxA: vec4f,    /* isentropic vortex: direction (x, y), position (x, y) */
   vtxB: vec4f,    /* isentropic vortex: mach number, beta */
+  shape: vec4f,   /* (shape id, angle [rad], 0, 0); see shape.wgsl */
+  naca: vec4f,    /* NACA 4-digit: (max camber m, its position p, thickness t, 0) */
 };
 
 @group(0) @binding(0) var<uniform> P: Params;
@@ -393,8 +395,96 @@ fn limit(bnd: vec3f, U: vec4f, Pv: vec4f) -> vec2f {
   }
   return vec2f(tl, success);
 }
-`,n=`/* Cell mask from the cylinder (assembled WITHOUT common.wgsl, which binds M read-only).
- * A cell belongs to the body if its center lies inside the disk. */
+`,n=`/* Body geometry as a signed distance function (negative inside), in world
+ * units. Shapes are defined in units of the size r = P.body.z around the
+ * center P.body.xy and rotated by the angle P.shape.y (counterclockwise;
+ * a positive angle of attack pitches the nose up, i.e. the body is rotated
+ * clockwise).
+ *   0 cylinder:      radius r
+ *   1 square:        half side 0.9 r
+ *   2 wedge:         15 degree half angle, apex upstream, length 2 r
+ *   3 double wedge:  diamond airfoil, chord 3.2 r, thickness 12% of chord
+ *   4 NACA 4-digit:  chord 3.2 r (euler geometries/geometry_airfoil.h formulas) */
+fn sdBox(p: vec2f, b: vec2f) -> f32 {
+  let d = abs(p) - b;
+  return length(max(d, vec2f(0.0))) + min(max(d.x, d.y), 0.0);
+}
+/* signed distance to a triangle (Inigo Quilez, MIT) */
+fn sdTriangle(p: vec2f, p0: vec2f, p1: vec2f, p2: vec2f) -> f32 {
+  let e0 = p1 - p0; let e1 = p2 - p1; let e2 = p0 - p2;
+  let v0 = p - p0; let v1 = p - p1; let v2 = p - p2;
+  let pq0 = v0 - e0 * clamp(dot(v0, e0) / dot(e0, e0), 0.0, 1.0);
+  let pq1 = v1 - e1 * clamp(dot(v1, e1) / dot(e1, e1), 0.0, 1.0);
+  let pq2 = v2 - e2 * clamp(dot(v2, e2) / dot(e2, e2), 0.0, 1.0);
+  let s = sign(e0.x * e2.y - e0.y * e2.x);
+  let d = min(min(vec2f(dot(pq0, pq0), s * (v0.x * e0.y - v0.y * e0.x)),
+                  vec2f(dot(pq1, pq1), s * (v1.x * e1.y - v1.y * e1.x))),
+                  vec2f(dot(pq2, pq2), s * (v2.x * e2.y - v2.y * e2.x)));
+  return -sqrt(d.x) * sign(d.y);
+}
+/* signed distance to a rhombus with half diagonals b (Inigo Quilez, MIT) */
+fn sdRhombus(p0: vec2f, b: vec2f) -> f32 {
+  let p = abs(p0);
+  let ndot = b.x * (b.x - 2.0 * p.x) - b.y * (b.y - 2.0 * p.y);
+  let h = clamp(ndot / dot(b, b), -1.0, 1.0);
+  let d = length(p - 0.5 * b * vec2f(1.0 - h, 1.0 + h));
+  return d * sign(p.x * b.y + p.y * b.x - b.x * b.y);
+}
+/* NACA 4-digit in chord units (leading edge at 0, trailing edge at 1):
+ * a pseudo distance |y - y_c(x)| - y_t(x), continued by the distance to the
+ * leading/trailing edge outside [0, 1]. Correct sign, smooth enough for normals. */
+fn sdNaca(q: vec2f) -> f32 {
+  let m = P.naca.x; let pp = P.naca.y; let t = P.naca.z;
+  if (q.x <= 0.0) { return length(q); }
+  if (q.x >= 1.0) { return length(q - vec2f(1.0, 0.0)); }
+  let x = q.x;
+  let yt = 5.0 * t * (0.2969 * sqrt(x) + x * (-0.126 + x * (-0.3516 + x * (0.2843 + x * (-0.1036)))));
+  var yc = 0.0;
+  if (m > 0.0) {
+    if (x < pp) { yc = m / (pp * pp) * (2.0 * pp * x - x * x); }
+    else { yc = m / ((1.0 - pp) * (1.0 - pp)) * (1.0 - 2.0 * pp + 2.0 * pp * x - x * x); }
+  }
+  return abs(q.y - yc) - yt;
+}
+fn bodySD(x: vec2f) -> f32 {
+  let r = P.body.z;
+  let a = P.shape.y;
+  let d = x - P.body.xy;
+  /* rotate into the body frame (by -angle) and scale to units of r */
+  let ca = cos(a); let sa = sin(a);
+  let q = vec2f(ca * d.x + sa * d.y, -sa * d.x + ca * d.y) / r;
+  let id = u32(P.shape.x + 0.5);
+  var s: f32;
+  if (id == 1u) {
+    s = sdBox(q, vec2f(0.9));
+  } else if (id == 2u) {
+    let tn = tan(15.0 * 3.14159265358979 / 180.0);
+    s = sdTriangle(q, vec2f(-1.2, 0.0), vec2f(0.8, -2.0 * tn), vec2f(0.8, 2.0 * tn));
+  } else if (id == 3u) {
+    s = sdRhombus(q, vec2f(1.6, 0.192));
+  } else if (id == 4u) {
+    /* chord 3.2 r, centered at mid chord */
+    s = 3.2 * sdNaca(q / 3.2 + vec2f(0.5, 0.0));
+  } else {
+    s = length(q) - 1.0;
+  }
+  return s * r;
+}
+/* outward normal from central differences of the distance function */
+fn bodyNormal(x: vec2f) -> vec2f {
+  let h = 0.25 * min(P.dx, P.dy);
+  let g = vec2f(bodySD(x + vec2f(h, 0.0)) - bodySD(x - vec2f(h, 0.0)),
+                bodySD(x + vec2f(0.0, h)) - bodySD(x - vec2f(0.0, h)));
+  let l = length(g);
+  return select(vec2f(1.0, 0.0), g / l, l > 0.0);
+}
+/* surface velocity of the body at x: translation plus rotation */
+fn bodySurfaceVel(x: vec2f) -> vec2f {
+  let d = x - P.body.xy;
+  return P.bodyVel.xy + P.bodyVel.z * vec2f(-d.y, d.x);
+}
+`,r=`/* Cell mask from the body (assembled WITHOUT common.wgsl, which binds M read-only).
+ * A cell belongs to the body if its center lies inside the shape (shape.wgsl). */
 @group(0) @binding(1) var<storage, read_write> MW: array<u32>;
 @compute @workgroup_size(WG, WG)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
@@ -402,10 +492,10 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   if (gid.x >= ncx || gid.y >= ncy) { return; }
   let c = vec2f(P.x0 + (f32(gid.x) + 0.5) * P.dx, P.y0 + (f32(gid.y) + 0.5) * P.dy);
   var fluid = 1u;
-  if (P.body.w > 0.5 && length(c - P.body.xy) < P.body.z) { fluid = 0u; }
+  if (P.body.w > 0.5 && bodySD(c) < 0.0) { fluid = 0u; }
   MW[gid.y * ncx + gid.x] = fluid;
 }
-`,r={MASK:n,FILL:`/* After the body moved: nodes that became active get a state. NOT part of
+`,i={MASK:r,FILL:`/* After the body moved: nodes that became active get a state. NOT part of
  * ryujin (whose mesh is fixed). The new state is the average of the
  * neighbors that were active before (a convex combination, hence
  * admissible), or the inflow state if there are none. A[i] holds the
@@ -443,10 +533,10 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
  *   x = x0 (left):        dirichlet (inflow state)
  *   x = x0 + Lx (right):  do_nothing
  *   y = y0, y0 + Ly:      slip, normal (0, -/+1)
- *   cylinder:             slip, with the exact circle normal. For a moving
- *                         cylinder the normal momentum relative to the body
- *                         velocity is removed (NOT in ryujin); E is kept, as
- *                         in ryujin's slip condition, unless |m| grows. */
+ *   body:                 slip, with the normal of the exact shape (shape.wgsl).
+ *                         For a moving body the normal momentum relative to
+ *                         the surface velocity is removed (NOT in ryujin); E
+ *                         is kept, as in ryujin's slip condition, unless |m| grows. */
 @group(0) @binding(1) var<uniform> ST: Stage;
 @group(0) @binding(2) var<storage, read_write> S: array<vec4f>;
 @group(0) @binding(3) var<storage, read> info: InfoR;
@@ -496,18 +586,14 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   if (ix > 0 && ix < nxm && iy > 0 && iy < nym) {
     /* interior boundary: adjacent to the body */
     let x = vec2f(P.x0 + f32(ix) * P.dx, P.y0 + f32(iy) * P.dy);
-    let d = x - P.body.xy;
-    let len = length(d);
-    if (len > 0.0) {
-      let n = d / len;
-      let mRel = U.yz - U.x * P.bodyVel.xy;
-      let m = U.yz - dot(mRel, n) * n;
-      /* A moving body can increase |m|; add that kinetic energy so the
-       * internal energy is unchanged. For a body at rest |m| never grows and
-       * this is exactly ryujin's slip condition (E kept). */
-      let dke = 0.5 * (dot(m, m) - dot(U.yz, U.yz)) / U.x;
-      U = vec4f(U.x, m, U.w + max(dke, 0.0));
-    }
+    let n = bodyNormal(x);
+    let mRel = U.yz - U.x * bodySurfaceVel(x);
+    let m = U.yz - dot(mRel, n) * n;
+    /* A moving body can increase |m|; add that kinetic energy so the
+     * internal energy is unchanged. For a body at rest |m| never grows and
+     * this is exactly ryujin's slip condition (E kept). */
+    let dke = 0.5 * (dot(m, m) - dot(U.yz, U.yz)) / U.x;
+    U = vec4f(U.x, m, U.w + max(dke, 0.0));
   }
   S[k] = U;
 }
@@ -814,9 +900,9 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   let i = gid.y * P.nx + gid.x;
   S[i] = S[3u * NN() + i];
 }
-`},i=e,a=t;function o(){return`const EPS: f32 = 1.1920929e-7;
+`},a=e,o=t,s=n;function c(){return`const EPS: f32 = 1.1920929e-7;
 const WG: u32 = 16u;
-`}function s(i){return i===`MASK`?o()+e+n:o()+e+t+r[i]}var c=160,l={nx:513,ny:257,x0:0,y0:-1,Lx:4,Ly:2,gamma:1.4,refRho:1,relaxSmall:100,relaxLarge:1e4,cfl:.9,evc:1,relaxFactor:1,newtonTol:1e-4,newtonMaxIter:2,inflow:[1.4,3,0,1],body:{cx:.6,cy:0,r:.25,enabled:!0},bcMode:0,vortex:{mach:1,beta:5,direction:[1,1],position:[-1,-1]}};function u(e){let t=new Uint32Array(e),n=new Float32Array(e);return{tau:n[1],time:n[2],steps:t[3],loViol:t[4],stViol:t[5],admViol:t[6]}}function d(e,[t,n,r,i]){return[t,t*n,t*r,i/(e-1)+.5*t*(n*n+r*r)]}var f=class{device;cfg;NN;dx;dy;p;b;bodyVel=[0,0];infoBusy=!1;g;gFinish;gMask;gFill;gCommit;constructor(e,t={}){this.device=e,this.cfg={...l,...t,body:{...l.body,...t.body??{}}};let n=this.cfg,r=GPUBufferUsage,i=n.nx*n.ny;this.NN=i,this.dx=n.Lx/(n.nx-1),this.dy=n.Ly/(n.ny-1);let a=t=>e.createComputePipeline({layout:`auto`,compute:{module:e.createShaderModule({code:s(t)}),entryPoint:`main`}});this.p={mask:a(`MASK`),fill:a(`FILL`),commit:a(`COMMIT`),bc:a(`BC`),dij:a(`DIJ`),tau:a(`TAU`),low:a(`LOW`),pij:a(`PIJ`),lim1:a(`LIM1`),lim2:a(`LIM2`),finish:a(`FINISH`)};let o=r.STORAGE|r.COPY_SRC|r.COPY_DST,u=(n.nx-1)*(n.ny-1);this.b={params:e.createBuffer({size:c,usage:r.UNIFORM|r.COPY_DST}),stage:[0,1,2].map(()=>e.createBuffer({size:32,usage:r.UNIFORM|r.COPY_DST})),S:e.createBuffer({size:4*i*16,usage:o}),D:e.createBuffer({size:i*10*4,usage:o}),RB:e.createBuffer({size:i*2*16,usage:o}),PM:e.createBuffer({size:i*8*16,usage:o}),LIJ:e.createBuffer({size:i*8*4,usage:o}),LN:e.createBuffer({size:i*8*4,usage:o}),info:e.createBuffer({size:32,usage:o}),infoRead:e.createBuffer({size:32,usage:r.MAP_READ|r.COPY_DST}),M:e.createBuffer({size:u*4,usage:o}),A:e.createBuffer({size:i*4,usage:o})},[{s:0,inSlot:0,outSlot:1,nst:0,slotA:0,slotB:0,wA:0,wB:0},{s:1,inSlot:1,outSlot:2,nst:1,slotA:0,slotB:0,wA:-1,wB:0},{s:2,inSlot:2,outSlot:3,nst:2,slotA:0,slotB:1,wA:.75,wB:-2}].forEach((t,n)=>{let r=new ArrayBuffer(32),i=new Uint32Array(r),a=new Float32Array(r);i[0]=t.s,i[1]=t.inSlot,i[2]=t.outSlot,i[3]=t.nst,i[4]=t.slotA,i[5]=t.slotB,a[6]=t.wA,a[7]=t.wB,e.queue.writeBuffer(this.b.stage[n],0,r)});let d=(t,n)=>e.createBindGroup({layout:t.getBindGroupLayout(0),entries:n.map(([e,t])=>({binding:e,resource:{buffer:t}}))}),f=this.b;this.g=[0,1,2].map(e=>({bc:d(this.p.bc,[[0,f.params],[1,f.stage[e]],[2,f.S],[3,f.info],[15,f.M]]),dij:d(this.p.dij,[[0,f.params],[1,f.stage[e]],[2,f.S],[3,f.D],[4,f.info],[15,f.M]]),tau:d(this.p.tau,[[1,f.stage[e]],[2,f.info]]),low:d(this.p.low,[[0,f.params],[1,f.stage[e]],[2,f.S],[3,f.D],[4,f.RB],[5,f.PM],[6,f.info],[15,f.M]]),pij:d(this.p.pij,[[0,f.params],[1,f.stage[e]],[2,f.S],[3,f.RB],[4,f.PM],[5,f.LIJ],[6,f.info],[15,f.M]]),lim1:d(this.p.lim1,[[0,f.params],[1,f.stage[e]],[2,f.S],[3,f.RB],[4,f.PM],[5,f.LIJ],[6,f.LN],[7,f.info],[15,f.M]]),lim2:d(this.p.lim2,[[0,f.params],[1,f.stage[e]],[2,f.S],[3,f.PM],[4,f.LN],[5,f.info],[15,f.M]])})),this.gFinish=d(this.p.finish,[[0,f.params],[1,f.S]]),this.gMask=d(this.p.mask,[[0,f.params],[1,f.M]]),this.gFill=d(this.p.fill,[[0,f.params],[1,f.S],[2,f.A],[15,f.M]]),this.gCommit=d(this.p.commit,[[0,f.params],[1,f.A],[15,f.M]]),this.writeParams(),this.resetInfo()}fluidArea(){let e=this.cfg,t=e.body,n=0;if(t.enabled){let r=Math.max(0,Math.floor((t.cx-t.r-e.x0)/this.dx)-1),i=Math.min(e.nx-2,Math.ceil((t.cx+t.r-e.x0)/this.dx)+1),a=Math.max(0,Math.floor((t.cy-t.r-e.y0)/this.dy)-1),o=Math.min(e.ny-2,Math.ceil((t.cy+t.r-e.y0)/this.dy)+1);for(let s=a;s<=o;s++)for(let a=r;a<=i;a++){let r=e.x0+(a+.5)*this.dx-t.cx,i=e.y0+(s+.5)*this.dy-t.cy;Math.hypot(r,i)<t.r&&n++}}return((e.nx-1)*(e.ny-1)-n)*this.dx*this.dy}writeParams(e){e&&Object.assign(this.cfg,e);let t=this.cfg,n=new ArrayBuffer(c),r=new Uint32Array(n),i=new Float32Array(n);r[0]=t.nx,r[1]=t.ny,r[2]=t.newtonMaxIter,r[3]=t.bcMode,i[4]=this.dx,i[5]=this.dy,i[6]=t.x0,i[7]=t.y0,i[8]=t.gamma,i[9]=t.refRho,i[10]=t.relaxSmall,i[11]=t.relaxLarge,i[12]=t.cfl,i[13]=t.evc,i[14]=t.relaxFactor,i[15]=t.newtonTol,i[16]=1/this.fluidArea(),i.set(d(t.gamma,t.inflow),20),i.set([t.body.cx,t.body.cy,t.body.r,+!!t.body.enabled],24),i.set([this.bodyVel[0],this.bodyVel[1],0,0],28);let a=t.vortex,o=Math.hypot(a.direction[0],a.direction[1]);i.set([a.direction[0]/o,a.direction[1]/o,a.position[0],a.position[1]],32),i.set([a.mach,a.beta,0,0],36),this.device.queue.writeBuffer(this.b.params,0,n)}resetInfo(){let e=new ArrayBuffer(32),t=new Uint32Array(e);t[0]=2139095040,this.device.queue.writeBuffer(this.b.info,0,e)}encodeMask(e,t){let n=this.cfg;e.setPipeline(this.p.mask),e.setBindGroup(0,this.gMask),e.dispatchWorkgroups(Math.ceil((n.nx-1)/16),Math.ceil((n.ny-1)/16));let r=Math.ceil(n.nx/16),i=Math.ceil(n.ny/16);t&&(e.setPipeline(this.p.fill),e.setBindGroup(0,this.gFill),e.dispatchWorkgroups(r,i)),e.setPipeline(this.p.commit),e.setBindGroup(0,this.gCommit),e.dispatchWorkgroups(r,i)}setState(e){this.device.queue.writeBuffer(this.b.S,0,e),this.resetInfo(),this.writeParams();let t=this.device.createCommandEncoder(),n=t.beginComputePass();this.encodeMask(n,!1),n.end(),this.device.queue.submit([t.finish()])}setUniform(){let e=d(this.cfg.gamma,this.cfg.inflow),t=new Float32Array(4*this.NN);for(let n=0;n<this.NN;n++)t.set(e,4*n);this.setState(t)}moveBody(e,t,n,r){this.cfg.body.cx=t,this.cfg.body.cy=n,this.bodyVel=r,this.writeParams(),this.encodeMask(e,!0)}async readInfo(){if(this.infoBusy)return null;this.infoBusy=!0;let e=this.device,t=this.b.infoRead,n=e.createCommandEncoder();n.copyBufferToBuffer(this.b.info,0,t,0,32),e.queue.submit([n.finish()]);try{await t.mapAsync(GPUMapMode.READ);let e=t.getMappedRange().slice(0);return t.unmap(),u(e)}catch{return null}finally{this.infoBusy=!1}}encodeSteps(e,t){let n=this.cfg,r=Math.ceil(n.nx/16),i=Math.ceil(n.ny/16),a=this.p;for(let n=0;n<t;n++){for(let t=0;t<3;t++){let n=this.g[t];e.setPipeline(a.bc),e.setBindGroup(0,n.bc),e.dispatchWorkgroups(r,i),e.setPipeline(a.dij),e.setBindGroup(0,n.dij),e.dispatchWorkgroups(r,i),e.setPipeline(a.tau),e.setBindGroup(0,n.tau),e.dispatchWorkgroups(1),e.setPipeline(a.low),e.setBindGroup(0,n.low),e.dispatchWorkgroups(r,i),e.setPipeline(a.pij),e.setBindGroup(0,n.pij),e.dispatchWorkgroups(r,i),e.setPipeline(a.lim1),e.setBindGroup(0,n.lim1),e.dispatchWorkgroups(r,i),e.setPipeline(a.lim2),e.setBindGroup(0,n.lim2),e.dispatchWorkgroups(r,i)}e.setPipeline(a.finish),e.setBindGroup(0,this.gFinish),e.dispatchWorkgroups(r,i)}}async read(){let e=this.device,t=GPUBufferUsage,n=e.createBuffer({size:this.NN*16,usage:t.MAP_READ|t.COPY_DST}),r=e.createBuffer({size:this.NN*4,usage:t.MAP_READ|t.COPY_DST}),i=e.createBuffer({size:32,usage:t.MAP_READ|t.COPY_DST}),a=e.createCommandEncoder();a.copyBufferToBuffer(this.b.S,0,n,0,this.NN*16),a.copyBufferToBuffer(this.b.A,0,r,0,this.NN*4),a.copyBufferToBuffer(this.b.info,0,i,0,32),e.queue.submit([a.finish()]),await Promise.all([n.mapAsync(GPUMapMode.READ),r.mapAsync(GPUMapMode.READ),i.mapAsync(GPUMapMode.READ)]);let o=new Float32Array(n.getMappedRange().slice(0)),s=new Uint32Array(r.getMappedRange().slice(0)),c=i.getMappedRange().slice(0);return n.unmap(),r.unmap(),i.unmap(),n.destroy(),r.destroy(),i.destroy(),{state:o,active:s,info:u(c)}}destroy(){for(let e of[`S`,`D`,`RB`,`PM`,`LIJ`,`LN`,`info`,`params`,`M`,`A`])this.b[e].destroy();for(let e of this.b.stage)e.destroy()}},p=`/* Per-node display quantities and their global ranges (non-negative floats,
+`}function l(a){return a===`MASK`?c()+e+n+r:c()+e+n+t+i[a]}var u=[`cylinder`,`square`,`wedge`,`doublewedge`,`naca`];function d(e){let t=e.padStart(4,`0`).split(``).map(Number);return[.01*t[0],.1*t[1],.1*t[2]+.01*t[3]]}function f(e){return{cylinder:1,square:.9*Math.SQRT2,wedge:1.2,doublewedge:1.6,naca:1.62}[e]}function p(e,t,n){let r=Math.abs(e)-n,i=Math.abs(t)-n;return Math.hypot(Math.max(r,0),Math.max(i,0))+Math.min(Math.max(r,i),0)}function m(e,t,n){let r=(n,r)=>(r[0]-n[0])*(t-n[1])-(r[1]-n[1])*(e-n[0]),i=r(n[0],n[1]),a=r(n[1],n[2]),o=r(n[2],n[0]);return i>=0&&a>=0&&o>=0||i<=0&&a<=0&&o<=0}function h(e,t,[n,r,i]){if(e<=0||e>=1)return!1;let a=e,o=5*i*(.2969*Math.sqrt(a)+a*(-.126+a*(-.3516+a*(.2843+a*-.1036)))),s=0;return n>0&&(s=a<r?n/(r*r)*(2*r*a-a*a):n/((1-r)*(1-r))*(1-2*r+2*r*a-a*a)),Math.abs(t-s)<o}function g(e,t,n){let r=-e.aoa,i=Math.cos(r),a=Math.sin(r),o=t-e.cx,s=n-e.cy,c=(i*o+a*s)/e.r,l=(-a*o+i*s)/e.r;switch(e.shape){case`square`:return p(c,l,.9)<0;case`wedge`:{let e=Math.tan(15*Math.PI/180);return m(c,l,[[-1.2,0],[.8,-2*e],[.8,2*e]])}case`doublewedge`:return Math.abs(c)/1.6+Math.abs(l)/.192<1;case`naca`:return h(c/3.2+.5,l/3.2,d(e.naca));default:return Math.hypot(c,l)<1}}var _=192,v={nx:513,ny:257,x0:0,y0:-1,Lx:4,Ly:2,gamma:1.4,refRho:1,relaxSmall:100,relaxLarge:1e4,cfl:.9,evc:1,relaxFactor:1,newtonTol:1e-4,newtonMaxIter:2,inflow:[1.4,3,0,1],body:{cx:.6,cy:0,r:.25,enabled:!0,shape:`cylinder`,aoa:0,naca:`0012`},bcMode:0,vortex:{mach:1,beta:5,direction:[1,1],position:[-1,-1]}};function y(e){let t=new Uint32Array(e),n=new Float32Array(e);return{tau:n[1],time:n[2],steps:t[3],loViol:t[4],stViol:t[5],admViol:t[6]}}function b(e,[t,n,r,i]){return[t,t*n,t*r,i/(e-1)+.5*t*(n*n+r*r)]}var ee=class{device;cfg;NN;dx;dy;p;b;bodyVel=[0,0,0];infoBusy=!1;g;gFinish;gMask;gFill;gCommit;constructor(e,t={}){this.device=e,this.cfg={...v,...t,body:{...v.body,...t.body??{}}};let n=this.cfg,r=GPUBufferUsage,i=n.nx*n.ny;this.NN=i,this.dx=n.Lx/(n.nx-1),this.dy=n.Ly/(n.ny-1);let a=t=>e.createComputePipeline({layout:`auto`,compute:{module:e.createShaderModule({code:l(t)}),entryPoint:`main`}});this.p={mask:a(`MASK`),fill:a(`FILL`),commit:a(`COMMIT`),bc:a(`BC`),dij:a(`DIJ`),tau:a(`TAU`),low:a(`LOW`),pij:a(`PIJ`),lim1:a(`LIM1`),lim2:a(`LIM2`),finish:a(`FINISH`)};let o=r.STORAGE|r.COPY_SRC|r.COPY_DST,s=(n.nx-1)*(n.ny-1);this.b={params:e.createBuffer({size:_,usage:r.UNIFORM|r.COPY_DST}),stage:[0,1,2].map(()=>e.createBuffer({size:32,usage:r.UNIFORM|r.COPY_DST})),S:e.createBuffer({size:4*i*16,usage:o}),D:e.createBuffer({size:i*10*4,usage:o}),RB:e.createBuffer({size:i*2*16,usage:o}),PM:e.createBuffer({size:i*8*16,usage:o}),LIJ:e.createBuffer({size:i*8*4,usage:o}),LN:e.createBuffer({size:i*8*4,usage:o}),info:e.createBuffer({size:32,usage:o}),infoRead:e.createBuffer({size:32,usage:r.MAP_READ|r.COPY_DST}),M:e.createBuffer({size:s*4,usage:o}),A:e.createBuffer({size:i*4,usage:o})},[{s:0,inSlot:0,outSlot:1,nst:0,slotA:0,slotB:0,wA:0,wB:0},{s:1,inSlot:1,outSlot:2,nst:1,slotA:0,slotB:0,wA:-1,wB:0},{s:2,inSlot:2,outSlot:3,nst:2,slotA:0,slotB:1,wA:.75,wB:-2}].forEach((t,n)=>{let r=new ArrayBuffer(32),i=new Uint32Array(r),a=new Float32Array(r);i[0]=t.s,i[1]=t.inSlot,i[2]=t.outSlot,i[3]=t.nst,i[4]=t.slotA,i[5]=t.slotB,a[6]=t.wA,a[7]=t.wB,e.queue.writeBuffer(this.b.stage[n],0,r)});let c=(t,n)=>e.createBindGroup({layout:t.getBindGroupLayout(0),entries:n.map(([e,t])=>({binding:e,resource:{buffer:t}}))}),u=this.b;this.g=[0,1,2].map(e=>({bc:c(this.p.bc,[[0,u.params],[1,u.stage[e]],[2,u.S],[3,u.info],[15,u.M]]),dij:c(this.p.dij,[[0,u.params],[1,u.stage[e]],[2,u.S],[3,u.D],[4,u.info],[15,u.M]]),tau:c(this.p.tau,[[1,u.stage[e]],[2,u.info]]),low:c(this.p.low,[[0,u.params],[1,u.stage[e]],[2,u.S],[3,u.D],[4,u.RB],[5,u.PM],[6,u.info],[15,u.M]]),pij:c(this.p.pij,[[0,u.params],[1,u.stage[e]],[2,u.S],[3,u.RB],[4,u.PM],[5,u.LIJ],[6,u.info],[15,u.M]]),lim1:c(this.p.lim1,[[0,u.params],[1,u.stage[e]],[2,u.S],[3,u.RB],[4,u.PM],[5,u.LIJ],[6,u.LN],[7,u.info],[15,u.M]]),lim2:c(this.p.lim2,[[0,u.params],[1,u.stage[e]],[2,u.S],[3,u.PM],[4,u.LN],[5,u.info],[15,u.M]])})),this.gFinish=c(this.p.finish,[[0,u.params],[1,u.S]]),this.gMask=c(this.p.mask,[[0,u.params],[1,u.M]]),this.gFill=c(this.p.fill,[[0,u.params],[1,u.S],[2,u.A],[15,u.M]]),this.gCommit=c(this.p.commit,[[0,u.params],[1,u.A],[15,u.M]]),this.writeParams(),this.resetInfo()}fluidArea(){let e=this.cfg,t=e.body,n=0;if(t.enabled){let r=t.r*f(t.shape),i=Math.max(0,Math.floor((t.cx-r-e.x0)/this.dx)-1),a=Math.min(e.nx-2,Math.ceil((t.cx+r-e.x0)/this.dx)+1),o=Math.max(0,Math.floor((t.cy-r-e.y0)/this.dy)-1),s=Math.min(e.ny-2,Math.ceil((t.cy+r-e.y0)/this.dy)+1);for(let r=o;r<=s;r++)for(let o=i;o<=a;o++)g(t,e.x0+(o+.5)*this.dx,e.y0+(r+.5)*this.dy)&&n++}return((e.nx-1)*(e.ny-1)-n)*this.dx*this.dy}writeParams(e){e&&Object.assign(this.cfg,e);let t=this.cfg,n=new ArrayBuffer(_),r=new Uint32Array(n),i=new Float32Array(n);r[0]=t.nx,r[1]=t.ny,r[2]=t.newtonMaxIter,r[3]=t.bcMode,i[4]=this.dx,i[5]=this.dy,i[6]=t.x0,i[7]=t.y0,i[8]=t.gamma,i[9]=t.refRho,i[10]=t.relaxSmall,i[11]=t.relaxLarge,i[12]=t.cfl,i[13]=t.evc,i[14]=t.relaxFactor,i[15]=t.newtonTol,i[16]=1/this.fluidArea(),i.set(b(t.gamma,t.inflow),20),i.set([t.body.cx,t.body.cy,t.body.r,+!!t.body.enabled],24),i.set([this.bodyVel[0],this.bodyVel[1],this.bodyVel[2],0],28);let a=t.vortex,o=Math.hypot(a.direction[0],a.direction[1]);i.set([a.direction[0]/o,a.direction[1]/o,a.position[0],a.position[1]],32),i.set([a.mach,a.beta,0,0],36),i.set([u.indexOf(t.body.shape),-t.body.aoa,0,0],40),i.set([...d(t.body.naca),0],44),this.device.queue.writeBuffer(this.b.params,0,n)}resetInfo(){let e=new ArrayBuffer(32),t=new Uint32Array(e);t[0]=2139095040,this.device.queue.writeBuffer(this.b.info,0,e)}encodeMask(e,t){let n=this.cfg;e.setPipeline(this.p.mask),e.setBindGroup(0,this.gMask),e.dispatchWorkgroups(Math.ceil((n.nx-1)/16),Math.ceil((n.ny-1)/16));let r=Math.ceil(n.nx/16),i=Math.ceil(n.ny/16);t&&(e.setPipeline(this.p.fill),e.setBindGroup(0,this.gFill),e.dispatchWorkgroups(r,i)),e.setPipeline(this.p.commit),e.setBindGroup(0,this.gCommit),e.dispatchWorkgroups(r,i)}setState(e){this.device.queue.writeBuffer(this.b.S,0,e),this.resetInfo(),this.writeParams();let t=this.device.createCommandEncoder(),n=t.beginComputePass();this.encodeMask(n,!1),n.end(),this.device.queue.submit([t.finish()])}setUniform(){let e=b(this.cfg.gamma,this.cfg.inflow),t=new Float32Array(4*this.NN);for(let n=0;n<this.NN;n++)t.set(e,4*n);this.setState(t)}moveBody(e,t,n,r,i){this.cfg.body.cx=t,this.cfg.body.cy=n,this.cfg.body.aoa=r,this.bodyVel=i,this.writeParams(),this.encodeMask(e,!0)}async readInfo(){if(this.infoBusy)return null;this.infoBusy=!0;let e=this.device,t=this.b.infoRead,n=e.createCommandEncoder();n.copyBufferToBuffer(this.b.info,0,t,0,32),e.queue.submit([n.finish()]);try{await t.mapAsync(GPUMapMode.READ);let e=t.getMappedRange().slice(0);return t.unmap(),y(e)}catch{return null}finally{this.infoBusy=!1}}encodeSteps(e,t){let n=this.cfg,r=Math.ceil(n.nx/16),i=Math.ceil(n.ny/16),a=this.p;for(let n=0;n<t;n++){for(let t=0;t<3;t++){let n=this.g[t];e.setPipeline(a.bc),e.setBindGroup(0,n.bc),e.dispatchWorkgroups(r,i),e.setPipeline(a.dij),e.setBindGroup(0,n.dij),e.dispatchWorkgroups(r,i),e.setPipeline(a.tau),e.setBindGroup(0,n.tau),e.dispatchWorkgroups(1),e.setPipeline(a.low),e.setBindGroup(0,n.low),e.dispatchWorkgroups(r,i),e.setPipeline(a.pij),e.setBindGroup(0,n.pij),e.dispatchWorkgroups(r,i),e.setPipeline(a.lim1),e.setBindGroup(0,n.lim1),e.dispatchWorkgroups(r,i),e.setPipeline(a.lim2),e.setBindGroup(0,n.lim2),e.dispatchWorkgroups(r,i)}e.setPipeline(a.finish),e.setBindGroup(0,this.gFinish),e.dispatchWorkgroups(r,i)}}async read(){let e=this.device,t=GPUBufferUsage,n=e.createBuffer({size:this.NN*16,usage:t.MAP_READ|t.COPY_DST}),r=e.createBuffer({size:this.NN*4,usage:t.MAP_READ|t.COPY_DST}),i=e.createBuffer({size:32,usage:t.MAP_READ|t.COPY_DST}),a=e.createCommandEncoder();a.copyBufferToBuffer(this.b.S,0,n,0,this.NN*16),a.copyBufferToBuffer(this.b.A,0,r,0,this.NN*4),a.copyBufferToBuffer(this.b.info,0,i,0,32),e.queue.submit([a.finish()]),await Promise.all([n.mapAsync(GPUMapMode.READ),r.mapAsync(GPUMapMode.READ),i.mapAsync(GPUMapMode.READ)]);let o=new Float32Array(n.getMappedRange().slice(0)),s=new Uint32Array(r.getMappedRange().slice(0)),c=i.getMappedRange().slice(0);return n.unmap(),r.unmap(),i.unmap(),n.destroy(),r.destroy(),i.destroy(),{state:o,active:s,info:y(c)}}destroy(){for(let e of[`S`,`D`,`RB`,`PM`,`LIJ`,`LN`,`info`,`params`,`M`,`A`])this.b[e].destroy();for(let e of this.b.stage)e.destroy()}},te=`/* Per-node display quantities and their global ranges (non-negative floats,
  * so the IEEE bit patterns are monotone and atomicMin/Max on u32 works).
  *   Q[2i]     = (schlieren q_i, pressure, density, temperature p / rho)
  *   Q[2i + 1] = (grad rho / rho (x, y), 0, 0)  (for the shaded "gas" view)
@@ -849,7 +935,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   atomicMin(&ST.rMin, bitcast<u32>(rho)); atomicMax(&ST.rMax, bitcast<u32>(rho));
   atomicMin(&ST.pMin, bitcast<u32>(p)); atomicMax(&ST.pMax, bitcast<u32>(p));
 }
-`,m=`struct Stats { qMin: u32, qMax: u32, rMin: u32, rMax: u32, pMin: u32, pMax: u32, p0: u32, p1: u32 };
+`,ne=`struct Stats { qMin: u32, qMax: u32, rMin: u32, rMax: u32, pMin: u32, pMax: u32, p0: u32, p1: u32 };
 struct R { field: u32, beta: f32, w: f32, h: f32 };
 @group(0) @binding(2) var<storage, read> Q: array<vec4f>;
 @group(0) @binding(3) var<storage, read> SS: Stats;
@@ -942,9 +1028,15 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
   let Lx = f32(P.nx - 1u) * P.dx; let Ly = f32(P.ny - 1u) * P.dy;
   let u = pos.x / RP.w; let v = 1.0 - pos.y / RP.h;
   let xw = vec2f(P.x0 + u * Lx, P.y0 + v * Ly);
-  if (P.body.w > 0.5 && length(xw - P.body.xy) < P.body.z) {
-    let edge = smoothstep(P.body.z * 0.9, P.body.z, length(xw - P.body.xy));
-    return vec4f(mix(vec3f(0.62, 0.66, 0.64), vec3f(0.85, 0.88, 0.86), edge), 1.0);
+  if (P.body.w > 0.5) {
+    let sd = bodySD(xw);
+    if (sd < 0.0) {
+      /* light the body like a solid: rim highlight and a top-left light */
+      let n = bodyNormal(xw);
+      let edge = smoothstep(-0.12 * P.body.z, 0.0, sd);
+      let lit = 0.72 + 0.18 * dot(n, normalize(vec2f(-0.5, 0.8))) * edge;
+      return vec4f(mix(vec3f(0.60, 0.64, 0.62), vec3f(0.88, 0.91, 0.89), edge) * lit + 0.08, 1.0);
+    }
   }
   let q = samp(u * f32(P.nx - 1u), v * f32(P.ny - 1u));
   var c: vec3f;
@@ -965,7 +1057,7 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
   }
   return vec4f(c, 1.0);
 }
-`,h={...l.body},g=[{name:`Density`,bar:`viridis`},{name:`Schlieren (|∇ρ|, β = 10)`,bar:`schlieren`},{name:`Pressure`,bar:`inferno`},{name:`Temperature p/ρ, shaded`,bar:`heat`}];function _(e){let t=document.getElementById(e);if(!t)throw Error(`missing element #`+e);return t}var v={running:!0,field:0,N:matchMedia(`(max-width: 820px)`).matches||/Android|iPhone|iPad/.test(navigator.userAgent)?129:257,info:{time:0,tau:0,steps:0,loViol:0,admViol:0,stViol:0},drag:null,target:null,bodySpeed:0,stats:[0,1,0,1,0,1]};function y(e){let t=_(`notice`);t.textContent=e,t.classList.add(`show`)}function b(e){_(`err`).textContent=e}function x(e,t,n){let r=_(e),i=_(`v-`+e),a=()=>{i.textContent=t(+r.value),n&&n(+r.value)};return r.addEventListener(`input`,a),a(),r}var S,C,w,T,E,D,O,k,A,j,M,N,P=!1,F={steps:0,wall:performance.now()};async function I(){if(!navigator.gpu){y(`WebGPU isn't available in this browser. Use a recent Chrome or Edge (desktop or Android), or Safari 26 or newer on iPhone, iPad and Mac.`);return}let e=await navigator.gpu.requestAdapter();if(!e){y(`WebGPU is available but no GPU adapter was found. Check that hardware acceleration is turned on.`);return}S=await e.requestDevice({requiredLimits:{maxStorageBuffersPerShaderStage:Math.min(8,e.limits.maxStorageBuffersPerShaderStage)}}),S.addEventListener(`uncapturederror`,e=>b(`GPU error: `+e.error.message)),S.lost.then(e=>y(`The GPU device was lost (`+e.message+`). Reload the page to continue.`));let t=_(`view`).getContext(`webgpu`);if(!t){y(`Could not create a WebGPU canvas context.`);return}C=t,w=navigator.gpu.getPreferredCanvasFormat(),C.configure({device:S,format:w,alphaMode:`opaque`});let n=S.createShaderModule({code:i+m});E=S.createRenderPipeline({layout:`auto`,vertex:{module:n,entryPoint:`vs`},fragment:{module:n,entryPoint:`fs`,targets:[{format:w}]},primitive:{topology:`triangle-list`}}),k=S.createComputePipeline({layout:`auto`,compute:{module:S.createShaderModule({code:o()+i+a+p}),entryPoint:`main`}}),O=S.createBuffer({size:16,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST}),M=S.createBuffer({size:32,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST}),N=S.createBuffer({size:32,usage:GPUBufferUsage.MAP_READ|GPUBufferUsage.COPY_DST}),_(`grid`).value=String(v.N),L(),requestAnimationFrame(W)}function L(){T&&(T.destroy(),j.destroy());let e=v.N;T=new f(S,{nx:e,ny:(e-1)/2+1,cfl:+_(`cfl`).value,inflow:[1.4,+_(`mach`).value,0,1],body:{...h}}),j=S.createBuffer({size:T.NN*32,usage:GPUBufferUsage.STORAGE}),A=S.createBindGroup({layout:k.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:T.b.params}},{binding:1,resource:{buffer:T.b.S,offset:0,size:T.NN*16}},{binding:2,resource:{buffer:j}},{binding:3,resource:{buffer:M}},{binding:15,resource:{buffer:T.b.M}}]}),D=S.createBindGroup({layout:E.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:T.b.params}},{binding:2,resource:{buffer:j}},{binding:3,resource:{buffer:M}},{binding:4,resource:{buffer:O}},{binding:5,resource:{buffer:T.b.A}}]}),R()}function R(){T.cfg.body={...h},T.bodyVel=[0,0],v.target=null,v.drag=null,v.bodySpeed=0,T.setUniform(),v.info={time:0,tau:0,steps:0,loViol:0,admViol:0,stViol:0},F={steps:0,wall:performance.now()}}function z(e){let t=_(`view`).getBoundingClientRect(),n=T.cfg;return{x:n.x0+(e.clientX-t.left)/t.width*n.Lx,y:n.y0+(1-(e.clientY-t.top)/t.height)*n.Ly}}function B(e,t){let n=T.cfg,r=n.body.r,i=2*Math.max(T.dx,T.dy);return{x:Math.min(Math.max(e,n.x0+r+4*i),n.x0+n.Lx-r-i),y:Math.min(Math.max(t,n.y0+r+i),n.y0+n.Ly-r-i)}}function V(){let e=_(`view`);e.addEventListener(`pointerdown`,t=>{let n=z(t),r=T.cfg.body,i=r.r*(t.pointerType===`touch`?2:1.3);Math.hypot(n.x-r.cx,n.y-r.cy)>i||(v.drag={dx:r.cx-n.x,dy:r.cy-n.y},v.target=B(r.cx,r.cy),e.setPointerCapture(t.pointerId),e.classList.add(`dragging`),_(`view-hint`).hidden=!0,t.preventDefault())}),e.addEventListener(`pointermove`,t=>{let n=z(t),r=T.cfg.body;if(v.drag){v.target=B(n.x+v.drag.dx,n.y+v.drag.dy);return}e.classList.toggle(`grab`,Math.hypot(n.x-r.cx,n.y-r.cy)<r.r*1.3)});let t=()=>{v.drag=null,e.classList.remove(`dragging`)};e.addEventListener(`pointerup`,t),e.addEventListener(`pointercancel`,t)}function H(e,t){let n=T.cfg.body,r=t*3*v.info.tau;if(!v.target||r<=0){(T.bodyVel[0]!==0||T.bodyVel[1]!==0)&&(T.bodyVel=[0,0],T.writeParams()),v.bodySpeed=0;return}let i=v.target.x-n.cx,a=v.target.y-n.cy,o=Math.hypot(i,a);if(o<1e-6){v.drag||(v.target=null),T.bodyVel=[0,0],T.writeParams(),v.bodySpeed=0;return}let s=Math.min(o,+_(`vmax`).value*r,.5*t*Math.min(T.dx,T.dy)),c=i/o*s/r,l=a/o*s/r;v.bodySpeed=Math.hypot(c,l),T.moveBody(e,n.cx+i/o*s,n.cy+a/o*s,[c,l])}function U(){let e=_(`view`),t=Math.min(window.devicePixelRatio||1,2),n=Math.max(1,Math.round(e.clientWidth*t)),r=Math.max(1,Math.round(e.clientHeight*t));(e.width!==n||e.height!==r)&&(e.width=n,e.height=r)}function W(){if(requestAnimationFrame(W),!T)return;U();let e=_(`view`),t=+_(`spf`).value;S.queue.writeBuffer(M,0,new Uint32Array([2139095040,0,2139095040,0,2139095040,0,0,0]));let n=new ArrayBuffer(16),r=new Uint32Array(n),i=new Float32Array(n);r[0]=v.field,i[1]=10,i[2]=e.width,i[3]=e.height,S.queue.writeBuffer(O,0,n);let a=S.createCommandEncoder(),o=a.beginComputePass();v.running&&(H(o,t),T.encodeSteps(o,t)),o.setPipeline(k),o.setBindGroup(0,A),o.dispatchWorkgroups(Math.ceil(T.cfg.nx/16),Math.ceil(T.cfg.ny/16)),o.end();let s=!P;s&&a.copyBufferToBuffer(M,0,N,0,32);let c=a.beginRenderPass({colorAttachments:[{view:C.getCurrentTexture().createView(),loadOp:`clear`,storeOp:`store`,clearValue:{r:0,g:0,b:0,a:1}}]});c.setPipeline(E),c.setBindGroup(0,D),c.draw(3),c.end(),S.queue.submit([a.finish()]),s&&G(),T.readInfo().then(e=>{e&&(v.info=e,J())})}async function G(){P=!0;try{await N.mapAsync(GPUMapMode.READ);let e=new Float32Array(N.getMappedRange().slice(0));N.unmap(),v.stats=[e[0],e[1],e[2],e[3],e[4],e[5]],q()}catch{}finally{P=!1}}function K(e){return Math.abs(e)>=100?e.toFixed(0):Math.abs(e)>=10?e.toFixed(1):e.toFixed(2)}function q(){let[e,t,n,r,i,a]=v.stats;_(`leg-bar`).className=`bar `+g[v.field].bar,_(`leg-unit`).textContent=g[v.field].name,v.field===0?(_(`leg-lo`).textContent=K(n),_(`leg-hi`).textContent=K(r)):v.field===2?(_(`leg-lo`).textContent=K(i),_(`leg-hi`).textContent=K(a)):v.field===3?(_(`leg-lo`).textContent=`inflow`,_(`leg-hi`).textContent=`3.2× inflow`):(_(`leg-lo`).textContent=`smooth`,_(`leg-hi`).textContent=`steep (`+K(t)+`)`)}function J(){let e=v.info,t=performance.now();if(_(`s-time`).textContent=e.time.toFixed(2),_(`s-dt`).textContent=(3*e.tau).toExponential(1),t-F.wall>1e3){let n=(e.steps-F.steps)/((t-F.wall)/1e3);_(`s-sps`).textContent=n>0?n.toFixed(0):`–`,F={steps:e.steps,wall:t}}_(`s-body`).textContent=v.bodySpeed.toFixed(2),_(`s-viol`).textContent=`${e.loViol} / ${e.admViol} / ${e.stViol}`}function Y(e){v.field=e,document.querySelectorAll(`[data-field]`).forEach(t=>t.setAttribute(`aria-pressed`,String(+t.dataset.field===e))),q()}function X(){v.running=!v.running,_(`btn-pause`).textContent=v.running?`Pause`:`Resume`}function Z(){v.target=B(h.cx,h.cy)}function Q(){_(`btn-pause`).addEventListener(`click`,X),_(`btn-reset`).addEventListener(`click`,()=>R()),_(`btn-center`).addEventListener(`click`,Z),document.querySelectorAll(`[data-field]`).forEach(e=>e.addEventListener(`click`,()=>Y(+e.dataset.field))),x(`mach`,e=>e.toFixed(1),e=>{T&&T.writeParams({inflow:[1.4,e,0,1]})}),x(`spf`,e=>String(e)),x(`vmax`,e=>e.toFixed(1)),x(`cfl`,e=>e.toFixed(2),e=>{T&&T.writeParams({cfl:e})}),_(`grid`).addEventListener(`change`,e=>{v.N=+e.target.value,L()});let e=_(`about`);_(`btn-about`).addEventListener(`click`,()=>e.showModal()),window.addEventListener(`keydown`,t=>{if(t.target instanceof HTMLInputElement||t.target instanceof HTMLSelectElement||e.open&&t.key!==`?`)return;let n=.05,r=T?.cfg.body;switch(t.key){case` `:X();break;case`r`:case`R`:R();break;case`1`:case`2`:case`3`:case`4`:Y(t.key-1);break;case`c`:case`C`:Z();break;case`?`:e.open?e.close():e.showModal();break;case`ArrowLeft`:r&&(v.target=B(r.cx-n,r.cy));break;case`ArrowRight`:r&&(v.target=B(r.cx+n,r.cy));break;case`ArrowUp`:r&&(v.target=B(r.cx,r.cy+n));break;case`ArrowDown`:r&&(v.target=B(r.cx,r.cy-n));break;default:return}t.preventDefault()})}Q(),V(),I().catch(e=>b(String(e)));</script>
+`,x={...v.body},S=[{name:`Density`,bar:`viridis`},{name:`Schlieren (|∇ρ|, β = 10)`,bar:`schlieren`},{name:`Pressure`,bar:`inferno`},{name:`Temperature p/ρ, shaded`,bar:`heat`}];function C(e){let t=document.getElementById(e);if(!t)throw Error(`missing element #`+e);return t}var w={running:!0,field:0,N:matchMedia(`(max-width: 820px)`).matches||/Android|iPhone|iPad/.test(navigator.userAgent)?129:257,info:{time:0,tau:0,steps:0,loViol:0,admViol:0,stViol:0},drag:null,target:null,bodySpeed:0,aoaTarget:0,stats:[0,1,0,1,0,1]};function T(e){let t=C(`notice`);t.textContent=e,t.classList.add(`show`)}function E(e){C(`err`).textContent=e}function D(e,t,n){let r=C(e),i=C(`v-`+e),a=()=>{i.textContent=t(+r.value),n&&n(+r.value)};return r.addEventListener(`input`,a),a(),r}var O,k,A,j,M,N,P,F,I,L,R,z,B=!1,V={steps:0,wall:performance.now()};async function re(){if(!navigator.gpu){T(`WebGPU isn't available in this browser. Use a recent Chrome or Edge (desktop or Android), or Safari 26 or newer on iPhone, iPad and Mac.`);return}let e=await navigator.gpu.requestAdapter();if(!e){T(`WebGPU is available but no GPU adapter was found. Check that hardware acceleration is turned on.`);return}O=await e.requestDevice({requiredLimits:{maxStorageBuffersPerShaderStage:Math.min(8,e.limits.maxStorageBuffersPerShaderStage)}}),O.addEventListener(`uncapturederror`,e=>E(`GPU error: `+e.error.message)),O.lost.then(e=>T(`The GPU device was lost (`+e.message+`). Reload the page to continue.`));let t=C(`view`).getContext(`webgpu`);if(!t){T(`Could not create a WebGPU canvas context.`);return}k=t,A=navigator.gpu.getPreferredCanvasFormat(),k.configure({device:O,format:A,alphaMode:`opaque`});let n=O.createShaderModule({code:a+s+ne});M=O.createRenderPipeline({layout:`auto`,vertex:{module:n,entryPoint:`vs`},fragment:{module:n,entryPoint:`fs`,targets:[{format:A}]},primitive:{topology:`triangle-list`}}),F=O.createComputePipeline({layout:`auto`,compute:{module:O.createShaderModule({code:c()+a+s+o+te}),entryPoint:`main`}}),P=O.createBuffer({size:16,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST}),R=O.createBuffer({size:32,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST}),z=O.createBuffer({size:32,usage:GPUBufferUsage.MAP_READ|GPUBufferUsage.COPY_DST}),C(`grid`).value=String(w.N),H(),requestAnimationFrame(q)}function H(){j&&(j.destroy(),L.destroy());let e=w.N;j=new ee(O,{nx:e,ny:(e-1)/2+1,cfl:+C(`cfl`).value,inflow:[1.4,+C(`mach`).value,0,1],body:U()}),L=O.createBuffer({size:j.NN*32,usage:GPUBufferUsage.STORAGE}),I=O.createBindGroup({layout:F.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:j.b.params}},{binding:1,resource:{buffer:j.b.S,offset:0,size:j.NN*16}},{binding:2,resource:{buffer:L}},{binding:3,resource:{buffer:R}},{binding:15,resource:{buffer:j.b.M}}]}),N=O.createBindGroup({layout:M.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:j.b.params}},{binding:2,resource:{buffer:L}},{binding:3,resource:{buffer:R}},{binding:4,resource:{buffer:P}},{binding:5,resource:{buffer:j.b.A}}]}),W()}function U(){let[e,t]=C(`shape`).value.split(`:`),n=e===`doublewedge`||e===`naca`?1:x.cx;return{...x,cx:n,shape:e,naca:t??`0012`,aoa:w.aoaTarget}}function W(){j.cfg.body=U(),j.writeParams(),j.bodyVel=[0,0,0],w.target=null,w.drag=null,w.bodySpeed=0,j.setUniform(),w.info={time:0,tau:0,steps:0,loViol:0,admViol:0,stViol:0},V={steps:0,wall:performance.now()}}function G(e){let t=C(`view`).getBoundingClientRect(),n=j.cfg;return{x:n.x0+(e.clientX-t.left)/t.width*n.Lx,y:n.y0+(1-(e.clientY-t.top)/t.height)*n.Ly}}function K(e,t){let n=j.cfg,r=n.body.r*f(n.body.shape),i=2*Math.max(j.dx,j.dy);return{x:Math.min(Math.max(e,n.x0+r+4*i),n.x0+n.Lx-r-i),y:Math.min(Math.max(t,n.y0+r+i),n.y0+n.Ly-r-i)}}function ie(){let e=C(`view`);e.addEventListener(`pointerdown`,t=>{let n=G(t),r=j.cfg.body,i=r.r*(t.pointerType===`touch`?1.6:1);!g(r,n.x,n.y)&&Math.hypot(n.x-r.cx,n.y-r.cy)>i||(w.drag={dx:r.cx-n.x,dy:r.cy-n.y},w.target=K(r.cx,r.cy),e.setPointerCapture(t.pointerId),e.classList.add(`dragging`),C(`view-hint`).hidden=!0,t.preventDefault())}),e.addEventListener(`pointermove`,t=>{let n=G(t),r=j.cfg.body;if(w.drag){w.target=K(n.x+w.drag.dx,n.y+w.drag.dy);return}e.classList.toggle(`grab`,g(r,n.x,n.y)||Math.hypot(n.x-r.cx,n.y-r.cy)<r.r)});let t=()=>{w.drag=null,e.classList.remove(`dragging`)};e.addEventListener(`pointerup`,t),e.addEventListener(`pointercancel`,t)}function ae(e,t){let n=j.cfg.body,r=t*3*w.info.tau,i=w.aoaTarget-n.aoa,a=!!w.target;if(!a&&!(Math.abs(i)>1e-6)||r<=0){j.bodyVel.some(e=>e!==0)&&(j.bodyVel=[0,0,0],j.writeParams()),w.bodySpeed=0;return}let o=Math.min(+C(`vmax`).value*r,.5*t*Math.min(j.dx,j.dy)),s=n.cx,c=n.cy,l=0,u=0;if(a){let e=w.target.x-n.cx,t=w.target.y-n.cy,i=Math.hypot(e,t);if(i<1e-6)w.drag||(w.target=null);else{let n=Math.min(i,o);s+=e/i*n,c+=t/i*n,l=e/i*n/r,u=t/i*n/r}}let d=n.r*f(n.shape),p=Math.sign(i)*Math.min(Math.abs(i),o/d),m=-p/r;w.bodySpeed=Math.hypot(l,u)+Math.abs(m)*d,j.moveBody(e,s,c,n.aoa+p,[l,u,m])}function oe(){let e=C(`view`),t=Math.min(window.devicePixelRatio||1,2),n=Math.max(1,Math.round(e.clientWidth*t)),r=Math.max(1,Math.round(e.clientHeight*t));(e.width!==n||e.height!==r)&&(e.width=n,e.height=r)}function q(){if(requestAnimationFrame(q),!j)return;oe();let e=C(`view`),t=+C(`spf`).value;O.queue.writeBuffer(R,0,new Uint32Array([2139095040,0,2139095040,0,2139095040,0,0,0]));let n=new ArrayBuffer(16),r=new Uint32Array(n),i=new Float32Array(n);r[0]=w.field,i[1]=10,i[2]=e.width,i[3]=e.height,O.queue.writeBuffer(P,0,n);let a=O.createCommandEncoder(),o=a.beginComputePass();w.running&&(ae(o,t),j.encodeSteps(o,t)),o.setPipeline(F),o.setBindGroup(0,I),o.dispatchWorkgroups(Math.ceil(j.cfg.nx/16),Math.ceil(j.cfg.ny/16)),o.end();let s=!B;s&&a.copyBufferToBuffer(R,0,z,0,32);let c=a.beginRenderPass({colorAttachments:[{view:k.getCurrentTexture().createView(),loadOp:`clear`,storeOp:`store`,clearValue:{r:0,g:0,b:0,a:1}}]});c.setPipeline(M),c.setBindGroup(0,N),c.draw(3),c.end(),O.queue.submit([a.finish()]),s&&se(),j.readInfo().then(e=>{e&&(w.info=e,ce())})}async function se(){B=!0;try{await z.mapAsync(GPUMapMode.READ);let e=new Float32Array(z.getMappedRange().slice(0));z.unmap(),w.stats=[e[0],e[1],e[2],e[3],e[4],e[5]],Y()}catch{}finally{B=!1}}function J(e){return Math.abs(e)>=100?e.toFixed(0):Math.abs(e)>=10?e.toFixed(1):e.toFixed(2)}function Y(){let[e,t,n,r,i,a]=w.stats;C(`leg-bar`).className=`bar `+S[w.field].bar,C(`leg-unit`).textContent=S[w.field].name,w.field===0?(C(`leg-lo`).textContent=J(n),C(`leg-hi`).textContent=J(r)):w.field===2?(C(`leg-lo`).textContent=J(i),C(`leg-hi`).textContent=J(a)):w.field===3?(C(`leg-lo`).textContent=`inflow`,C(`leg-hi`).textContent=`3.2× inflow`):(C(`leg-lo`).textContent=`smooth`,C(`leg-hi`).textContent=`steep (`+J(t)+`)`)}function ce(){let e=w.info,t=performance.now();if(C(`s-time`).textContent=e.time.toFixed(2),C(`s-dt`).textContent=(3*e.tau).toExponential(1),t-V.wall>1e3){let n=(e.steps-V.steps)/((t-V.wall)/1e3);C(`s-sps`).textContent=n>0?n.toFixed(0):`–`,V={steps:e.steps,wall:t}}C(`s-body`).textContent=w.bodySpeed.toFixed(2),C(`s-viol`).textContent=`${e.loViol} / ${e.admViol} / ${e.stViol}`}function X(e){w.field=e,document.querySelectorAll(`[data-field]`).forEach(t=>t.setAttribute(`aria-pressed`,String(+t.dataset.field===e))),Y()}function Z(){w.running=!w.running,C(`btn-pause`).textContent=w.running?`Pause`:`Resume`}function Q(){let e=U();w.target=K(e.cx,e.cy)}function $(e){w.aoaTarget=e*Math.PI/180;let t=C(`aoa`);+t.value!==e&&(t.value=String(e),C(`v-aoa`).textContent=e.toFixed(0)+`°`)}function le(){C(`btn-pause`).addEventListener(`click`,Z),C(`btn-reset`).addEventListener(`click`,()=>W()),C(`btn-center`).addEventListener(`click`,Q),document.querySelectorAll(`[data-field]`).forEach(e=>e.addEventListener(`click`,()=>X(+e.dataset.field))),D(`mach`,e=>e.toFixed(1),e=>{j&&j.writeParams({inflow:[1.4,e,0,1]})}),D(`spf`,e=>String(e)),D(`aoa`,e=>e.toFixed(0)+`°`,e=>{w.aoaTarget=e*Math.PI/180}),C(`shape`).addEventListener(`change`,()=>{j&&W()}),D(`vmax`,e=>e.toFixed(1)),D(`cfl`,e=>e.toFixed(2),e=>{j&&j.writeParams({cfl:e})}),C(`grid`).addEventListener(`change`,e=>{w.N=+e.target.value,H()});let e=C(`about`);C(`btn-about`).addEventListener(`click`,()=>e.showModal()),window.addEventListener(`keydown`,t=>{if(t.target instanceof HTMLInputElement||t.target instanceof HTMLSelectElement||e.open&&t.key!==`?`)return;let n=.05,r=j?.cfg.body;switch(t.key){case` `:Z();break;case`r`:case`R`:W();break;case`1`:case`2`:case`3`:case`4`:X(t.key-1);break;case`c`:case`C`:Q();break;case`?`:e.open?e.close():e.showModal();break;case`ArrowLeft`:r&&(w.target=K(r.cx-n,r.cy));break;case`ArrowRight`:r&&(w.target=K(r.cx+n,r.cy));break;case`ArrowUp`:r&&(w.target=K(r.cx,r.cy+n));break;case`ArrowDown`:r&&(w.target=K(r.cx,r.cy-n));break;case`[`:$(Math.max(-30,Math.round(w.aoaTarget*180/Math.PI)-2));break;case`]`:$(Math.min(30,Math.round(w.aoaTarget*180/Math.PI)+2));break;default:return}t.preventDefault()})}le(),ie(),re().catch(e=>E(String(e)));</script>
   <style rel="stylesheet" crossorigin>:root{--bg:#e7ece7;--panel:#f5f7f4;--ink:#1c2925;--muted:#56665f;--line:#c7d1ca;--accent:#245f9f;--accent-ink:#fff;--warn:#9a3b1c;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#141b19;--panel:#1c2522;--ink:#e2e9e5;--muted:#93a39c;--line:#33413b;--accent:#72a9df;--accent-ink:#0d1a26;--warn:#e59474}}:root[data-theme=dark]{--bg:#141b19;--panel:#1c2522;--ink:#e2e9e5;--muted:#93a39c;--line:#33413b;--accent:#72a9df;--accent-ink:#0d1a26;--warn:#e59474}*,:before,:after{box-sizing:inherit}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{background:var(--bg);color:var(--ink);-webkit-font-smoothing:antialiased;margin:0;font-family:Public Sans,ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;font-size:15px;line-height:1.45}.app{grid-template:"top top""tools side""stage side"minmax(0,1fr)/minmax(0,1fr) 20rem;gap:.6rem 1rem;height:100dvh;padding:.6rem 1rem .75rem;display:grid;overflow:hidden}header.top{grid-area:top;align-items:baseline;gap:.75rem;display:flex}header.top h1{letter-spacing:-.01em;margin:0;font-size:1.3rem;font-weight:700}header.top .tagline{color:var(--muted);white-space:nowrap;text-overflow:ellipsis;flex:1;min-width:0;margin:0;font-size:.9rem;overflow:hidden}button.icon{border-radius:50%;width:1.9rem;height:1.9rem;padding:0;font-weight:700}.toolbar{flex-wrap:wrap;grid-area:tools;align-items:center;gap:.4rem .6rem;display:flex}.toolbar select{width:auto;max-width:16rem;margin:0}.seg{display:inline-flex}.seg button{white-space:nowrap;border-radius:0;margin-left:-1px}.seg button:first-child{border-radius:3px 0 0 3px;margin-left:0}.seg button:last-child{border-radius:0 3px 3px 0}.seg button:focus-visible{z-index:1;position:relative}.stage-col{flex-direction:column;grid-area:stage;min-width:0;min-height:0;display:flex}.stage-wrap{flex:auto;place-items:start center;min-height:0;display:grid;container-type:size}.stage{aspect-ratio:2;border:1px solid var(--line);touch-action:none;background:#26332e;width:min(100cqw,200cqh);position:relative}.stage canvas{cursor:default;width:100%;height:100%;display:block}.stage canvas.grab{cursor:grab}.stage canvas.dragging{cursor:grabbing}.stage canvas.orbit{cursor:grab}.stage canvas.orbit:active{cursor:grabbing}.stage .notice{background:var(--panel);color:var(--ink);text-align:center;justify-content:center;align-items:center;padding:2rem;display:none;position:absolute;inset:0}.stage .notice.show{display:flex}.stage .viewhint{color:#e2e9e5;pointer-events:none;background:#141b199e;border-radius:4px;padding:.2rem .5rem;font-size:.72rem;position:absolute;top:.6rem;right:.6rem}.stats{font-variant-numeric:tabular-nums;flex-wrap:wrap;justify-content:center;gap:.15rem 1.1rem;margin-top:.45rem;font-size:.8rem;display:flex}.stats div{align-items:baseline;gap:.35rem;display:flex}.stats span{color:var(--muted)}.stats b{font-weight:600}.stats .lar b{color:var(--warn)}#err{color:var(--warn);white-space:pre-wrap;text-align:center;max-height:4.5rem;font-size:.8rem;overflow:auto}.controls{background:var(--panel);border:1px solid var(--line);flex-direction:column;grid-area:side;min-height:0;display:flex}.tabs{border-bottom:1px solid var(--line);flex:none;display:flex}.tabs button{color:var(--muted);background:0 0;border:0;border-bottom:2px solid #0000;border-radius:0;flex:1;margin-bottom:-1px;padding:.55rem .2rem;font-size:.85rem}.tabs button[aria-selected=true]{color:var(--ink);border-bottom-color:var(--accent);font-weight:600}.tabs button:hover{color:var(--ink)}.panel{flex:auto;min-height:0;padding:.4rem 1rem 1rem;overflow-y:auto}.panel>.row:first-child,.panel>label.field:first-child{margin-top:.5rem}dialog{border:1px solid var(--line);background:var(--panel);max-width:min(40rem,100vw - 2rem);max-height:calc(100dvh - 2rem);color:var(--ink);padding:1rem 1.25rem;font-size:.9rem}dialog::backdrop{background:#00000073}dialog h2{margin:0 0 .5rem;font-size:1.15rem}dialog h3{margin:1rem 0 .3rem;font-size:.95rem}dialog p{color:var(--muted);margin:.4rem 0}.keys{grid-template-columns:max-content 1fr;gap:.25rem 1rem;margin:0 0 1rem;display:grid}.keys dt{font-variant-numeric:tabular-nums;font-weight:600}.keys dd{color:var(--muted);margin:0}.row{flex-wrap:wrap;gap:.4rem;display:flex}label.field{margin-top:.5rem;font-size:.9rem;display:block}label.field.check{align-items:flex-start;gap:.5rem;display:flex}label.field.check input{accent-color:var(--accent);margin-top:.25rem}label.field .val{float:right;color:var(--muted);font-variant-numeric:tabular-nums}input[type=range]{width:100%;accent-color:var(--accent);margin:.2rem 0 0}select{width:100%;font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--line);margin-top:.2rem;padding:.35rem .4rem}button,.filebtn{font:inherit;border:1px solid var(--line);background:var(--bg);color:var(--ink);cursor:pointer;border-radius:3px;padding:.4rem .7rem;font-size:.9rem}button:hover,.filebtn:hover{border-color:var(--accent)}button.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:600}button[aria-pressed=true]{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}button:focus-visible,select:focus-visible,input:focus-visible,.filebtn:focus-within{outline:2px solid var(--accent);outline-offset:2px}.filebtn input{opacity:0;width:1px;height:1px;position:absolute}.hint{color:var(--muted);margin:.4rem 0 0;font-size:.82rem}@media (max-width:820px){.app{grid-template:"top""tools""stage""side"/minmax(0,1fr);height:auto;padding:.6rem 16px 1rem;overflow:visible}.stage-wrap{display:block;container-type:normal}.stage{width:100%}.panel{overflow:visible}.toolbar select{max-width:100%}}[hidden]{display:none!important}.stage .legend{color:#e2e9e5;pointer-events:none;background:#141b19b8;border-radius:4px;width:min(15rem,45%);padding:.35rem .5rem .3rem;font-size:.72rem;position:absolute;bottom:.6rem;left:.6rem}.stage .legend .bar{border-radius:2px;height:.5rem}.stage .legend .bar.viridis{background:linear-gradient(90deg,#440154,#3b528b,#21918c,#5ec962,#fde725)}.stage .legend .bar.inferno{background:linear-gradient(90deg,#000004,#57106e,#bc3754,#f98e09,#fcffa4)}.stage .legend .bar.heat{background:linear-gradient(90deg,#0d1a38 0%,#8c2947 40%,#ff8c1f 80%,#ffedc7 100%)}.stage .legend .bar.schlieren{background:linear-gradient(90deg,#f7faf7,#8a8c8a 40%,#000 100%)}.stage .legend .ticks{font-variant-numeric:tabular-nums;justify-content:space-between;margin-top:.1rem;display:flex}.stage .legend .unit{color:#93a39c}@media (max-width:820px){.stage .legend{width:34%;padding:.2rem .35rem;font-size:.62rem;bottom:.35rem;left:.35rem}.stage .legend .unit{display:none}.stage .viewhint{font-size:.62rem;top:.35rem;right:.35rem}}
 /*$vite$:1*/</style>
 <link rel="manifest" href="manifest.webmanifest">
@@ -976,7 +1068,7 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
 <div class="app">
   <header class="top">
     <h1>Supersonic</h1>
-    <p class="tagline">ryujin Euler on your GPU: drag the cylinder through a Mach 3 stream</p>
+    <p class="tagline">ryujin Euler on your GPU: drag a body through a Mach 3 stream</p>
     <button class="icon" id="btn-about" aria-label="About and keyboard shortcuts" title="About and keyboard shortcuts (?)">?</button>
   </header>
 
@@ -994,21 +1086,21 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
   <div class="stage-col">
     <div class="stage-wrap">
     <div class="stage" id="stage">
-      <canvas id="view" aria-label="Simulation view. Drag the cylinder to move it."></canvas>
+      <canvas id="view" aria-label="Simulation view. Drag the body to move it."></canvas>
       <div class="notice" id="notice"></div>
       <div class="legend" id="legend" aria-hidden="true">
         <div class="bar viridis" id="leg-bar"></div>
         <div class="ticks"><span id="leg-lo">–</span><span id="leg-hi">–</span></div>
         <div class="unit" id="leg-unit">Density</div>
       </div>
-      <div class="viewhint" id="view-hint">Drag the cylinder</div>
+      <div class="viewhint" id="view-hint">Drag the body</div>
     </div>
     </div>
     <div class="stats" aria-live="off">
       <div><span>Time</span><b id="s-time">0.00</b></div>
       <div><span>Step</span><b id="s-dt">–</b></div>
       <div><span>Steps/s</span><b id="s-sps">–</b></div>
-      <div><span>Cylinder speed</span><b id="s-body">0.00</b></div>
+      <div><span>Body speed</span><b id="s-body">0.00</b></div>
       <div title="Limiter bound failures / non-admissible high-order states / stages with too large tau"><span>Violations</span><b id="s-viol">–</b></div>
     </div>
     <div id="err"></div>
@@ -1016,6 +1108,18 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
 
   <aside class="controls">
     <div class="panel">
+      <label class="field">Body
+        <select id="shape">
+          <option value="cylinder">Cylinder (ryujin benchmark)</option>
+          <option value="square">Square</option>
+          <option value="wedge">Wedge, 15° half angle</option>
+          <option value="doublewedge">Double wedge airfoil</option>
+          <option value="naca:0012">NACA 0012 airfoil</option>
+          <option value="naca:2412">NACA 2412 airfoil</option>
+        </select></label>
+      <label class="field">Angle of attack <span class="val" id="v-aoa"></span>
+        <input type="range" id="aoa" min="-30" max="30" step="1" value="0"></label>
+      <p class="hint">Rotates the body (nose up for positive angles); it turns at a limited rate while the flow keeps running.</p>
       <label class="field">Inflow Mach number <span class="val" id="v-mach"></span>
         <input type="range" id="mach" min="1.5" max="5" step="0.1" value="3"></label>
       <p class="hint">Density 1.4 and pressure 1 (sound speed 1), as in ryujin's Mach 3 cylinder benchmark.</p>
@@ -1028,13 +1132,13 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
         </select></label>
       <label class="field">Steps per frame <span class="val" id="v-spf"></span>
         <input type="range" id="spf" min="1" max="20" step="1" value="4"></label>
-      <label class="field">Max cylinder speed <span class="val" id="v-vmax"></span>
+      <label class="field">Max body speed <span class="val" id="v-vmax"></span>
         <input type="range" id="vmax" min="0.2" max="3" step="0.1" value="1.5"></label>
-      <p class="hint">In units of the inflow sound speed. Dragging faster than this, the cylinder follows with a lag.</p>
+      <p class="hint">In units of the inflow sound speed. Dragging faster than this, the body follows with a lag.</p>
       <label class="field">CFL number <span class="val" id="v-cfl"></span>
         <input type="range" id="cfl" min="0.1" max="1" step="0.05" value="0.9"></label>
       <div class="row" style="margin-top:0.8rem">
-        <button id="btn-center" title="Move the cylinder back to its benchmark position (C)">Recenter cylinder</button>
+        <button id="btn-center" title="Move the body back to its starting position (C)">Recenter body</button>
       </div>
     </div>
   </aside>
@@ -1047,8 +1151,9 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
     guaranteed maximum wave speed, an entropy-viscosity indicator, convex limiting of density and specific entropy, and
     third-order explicit Runge–Kutta. Single precision.</p>
   <p>The setup is ryujin's Mach 3 cylinder benchmark: a channel [0, 4] × [−1, 1], a cylinder of diameter 0.5,
-    supersonic inflow on the left, outflow on the right, slip walls. Here the cylinder is cut out of a uniform grid
-    instead of using a body-fitted mesh, and you can move it.</p>
+    supersonic inflow on the left, outflow on the right, slip walls. Here the body is cut out of a uniform grid
+    instead of using a body-fitted mesh, and you can move it, rotate it, or swap it for a square, a wedge, or an airfoil
+    (NACA 4-digit profiles use ryujin's airfoil formulas).</p>
   <p>Verification: on ryujin's isentropic-vortex test (33 × 33 nodes, t = 2) the error norms agree with ryujin's
     double-precision reference output to within 3·10⁻⁴ (relative).</p>
   <h3>Keyboard</h3>
@@ -1056,8 +1161,9 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
     <dt>Space</dt><dd>Pause or resume</dd>
     <dt>R</dt><dd>Restart from a uniform stream</dd>
     <dt>1 / 2 / 3 / 4</dt><dd>Density / schlieren / pressure / shaded gas</dd>
-    <dt>C</dt><dd>Recenter the cylinder</dd>
-    <dt>Arrows</dt><dd>Nudge the cylinder</dd>
+    <dt>C</dt><dd>Recenter the body</dd>
+    <dt>Arrows</dt><dd>Nudge the body</dd>
+    <dt>[ / ]</dt><dd>Angle of attack down / up</dd>
     <dt>?</dt><dd>This dialog</dd>
   </dl>
   <form method="dialog"><button class="primary">Close</button></form>
