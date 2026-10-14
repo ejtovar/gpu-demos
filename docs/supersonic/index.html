@@ -647,8 +647,11 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 `,BC:`/* hyperbolic_module.template.h, apply_boundary_conditions() with
  * HyperbolicSystemView::apply_boundary_conditions() for the boundary ids of
  * ryujin's "cylinder" geometry:
- *   x = x0 (left):        dirichlet (inflow state)
- *   x = x0 + Lx (right):  do_nothing
+ *   x = x0, x0 + Lx:      dynamic, with the inflow state as Dirichlet data
+ *                         (ryujin's cylinder geometry uses dirichlet and
+ *                         do_nothing, which agree for supersonic flow; the
+ *                         dynamic condition also handles flows that turn
+ *                         subsonic, e.g. channels choked by obstacles)
  *   y = y0, y0 + Ly:      slip, normal (0, -/+1), or optionally ryujin's
  *                         dynamic condition with the inflow state as data
  *   body:                 slip, with the normal of the exact shape (shape.wgsl).
@@ -730,8 +733,11 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     /* closed box: slip walls left and right too */
     let n = vec2f(select(-1.0, 1.0, ix == nxm), 0.0);
     U = vec4f(U.x, U.yz - dot(U.yz, n) * n, U.w);
-  } else if (ix == 0) {
-    U = P.inflow;
+  } else if (ix == 0 || ix == nxm) {
+    /* left and right: dynamic, with the inflow state as data (supersonic
+     * inflow imposes it fully, supersonic outflow imposes nothing, the
+     * subsonic cases prescribe one Riemann characteristic) */
+    U = dynamicBC(U, vec2f(select(-1.0, 1.0, ix == nxm), 0.0));
   }
   if (iy == 0 || iy == nym) {
     let n = vec2f(0.0, select(-1.0, 1.0, iy == nym));
@@ -1407,9 +1413,11 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
     <a href="https://github.com/conservation-laws/ryujin">ryujin</a>: continuous Q1 finite elements, graph viscosity with a
     guaranteed maximum wave speed, an entropy-viscosity indicator, convex limiting of density and specific entropy, and
     third-order explicit Runge–Kutta. Single precision.</p>
-  <p>The setup is ryujin's Mach 3 cylinder benchmark: a channel [0, 4] × [−1, 1], a cylinder of diameter 0.5,
-    supersonic inflow on the left, outflow on the right, slip walls. Here the body is cut out of a uniform grid
-    instead of using a body-fitted mesh, and you can move it, rotate it, or swap it for a square, a wedge, or an airfoil
+  <p>The setup is ryujin's Mach 3 cylinder benchmark: a channel [0, 4] × [−1, 1], a cylinder of diameter 0.5. Left and
+    right use ryujin's dynamic boundary condition with the inflow state as data (for a supersonic stream: full inflow
+    on the left, free outflow on the right; it stays correct when obstacles make the flow subsonic); top and bottom are
+    slip walls or, optionally, dynamic. The obstacle is masked out of a fixed uniform grid (a level set marks its cells,
+    and the slip condition is enforced on the edge nodes) instead of using a body-fitted mesh, and you can move it, rotate it, or swap it for a square, a wedge, or an airfoil
     (NACA 4-digit profiles use ryujin's airfoil formulas). You can also draw obstacles, read lift and drag, and let the
     gas forces fly the body.</p>
   <p>Lift and drag come from the pressure on the body, F = Σ p<sub>i</sub> ν<sub>i</sub> with ν<sub>i</sub> the discrete
