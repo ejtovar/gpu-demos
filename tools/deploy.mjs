@@ -89,7 +89,7 @@ fs.writeFileSync(path.join(site, 'index.html'), `<!doctype html>
 ${APPS.map((a) => `  <a class="app" href="${a.id}/"><img src="${a.id}/icon-192.png" alt=""><div><h2>${a.name}</h2><p>${a.desc}</p></div></a>`).join('\n')}
   <div class="note">
     <p><b>Install on a phone:</b> open an app, then on iPhone tap Share → <i>Add to Home Screen</i>; on Android tap the menu → <i>Install app</i>. It then opens full screen, like an app, and works offline.</p>
-    <p><b>Needs WebGPU:</b> Safari 26 or newer on iPhone and iPad, Chrome or Edge on Android and desktop.</p>
+    <p><b>Needs WebGPU:</b> Chrome or Edge on Mac, Windows and Android; Safari on iOS/iPadOS 26 and macOS 26 or newer. On an older Mac, Safari can turn it on: Settings → Advanced → <i>Show features for web developers</i>, then Develop → Feature Flags → <i>WebGPU</i>.</p>
   </div>
 </main>
 </body>

@@ -1,4 +1,4 @@
-const CACHE = "runoff-43d8e06a65b1";
+const CACHE = "runoff-c042e012feef";
 const FILES = ["./", "manifest.webmanifest", "icon-180.png", "icon-192.png", "icon-512.png"];
 self.addEventListener("install", (e) => { e.waitUntil(caches.open(CACHE).then((c) => c.addAll(FILES))); self.skipWaiting(); });
 self.addEventListener("activate", (e) => {

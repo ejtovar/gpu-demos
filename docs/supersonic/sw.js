@@ -1,4 +1,4 @@
-const CACHE = "supersonic-8687e709046b";
+const CACHE = "supersonic-b6a1f5321ff2";
 const FILES = ["./", "manifest.webmanifest", "icon-180.png", "icon-192.png", "icon-512.png"];
 self.addEventListener("install", (e) => { e.waitUntil(caches.open(CACHE).then((c) => c.addAll(FILES))); self.skipWaiting(); });
 self.addEventListener("activate", (e) => {
