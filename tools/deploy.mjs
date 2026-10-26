@@ -1,4 +1,4 @@
-/* Builds runoff and supersonic and assembles site/ for GitHub Pages:
+/* Builds runoff, supersonic and stratus and assembles site/ for GitHub Pages:
  *   site/index.html                launcher
  *   site/<app>/index.html          the app's single-file build + install tags
  *   site/<app>/manifest.webmanifest, sw.js, icon-*.png
@@ -14,6 +14,8 @@ const APPS = [
     desc: 'Flash floods on your GPU: ryujin shallow water in the browser.' },
   { id: 'supersonic', dir: `${HOME}/Projects/supersonic`, out: 'dist/supersonic.html', name: 'Supersonic', short: 'Supersonic', color: '#1c2522',
     desc: 'Drag a cylinder through a Mach 3 stream: ryujin Euler in the browser.' },
+  { id: 'stratus', dir: `${HOME}/Projects/stratus`, out: 'dist/stratus.html', name: 'Stratus', short: 'Stratus', color: '#1c2522',
+    desc: 'Wind over mountains you draw, in a stratified atmosphere: ryujin Euler with gravity.' },
 ];
 const site = path.resolve('docs');
 const skipBuild = process.argv.includes('--no-build');
@@ -85,7 +87,7 @@ fs.writeFileSync(path.join(site, 'index.html'), `<!doctype html>
 <body>
 <main>
   <h1>GPU fluid demos</h1>
-  <p class="lead">Two finite element solvers from <a href="https://github.com/conservation-laws/ryujin">ryujin</a>, ported to WebGPU. They run entirely on your device's GPU.</p>
+  <p class="lead">Finite element solvers from <a href="https://github.com/conservation-laws/ryujin">ryujin</a>, ported to WebGPU. They run entirely on your device's GPU.</p>
 ${APPS.map((a) => `  <a class="app" href="${a.id}/"><img src="${a.id}/icon-192.png" alt=""><div><h2>${a.name}</h2><p>${a.desc}</p></div></a>`).join('\n')}
   <div class="note">
     <p><b>Install on a phone:</b> open an app, then on iPhone tap Share → <i>Add to Home Screen</i>; on Android tap the menu → <i>Install app</i>. It then opens full screen, like an app, and works offline.</p>

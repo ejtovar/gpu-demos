@@ -1,0 +1,1372 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Stratus: wind over mountains on WebGPU</title>
+<meta name="description" content="Wind over terrain you draw, in a stratified atmosphere: compressible Euler equations with gravity, computed on your GPU with a WebGPU port of ryujin's Euler solver.">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Stratus">
+<meta name="theme-color" content="#1c2522">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Public+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <script type="module" crossorigin>(function(){let e=document.createElement(`link`).relList;if(e&&e.supports&&e.supports(`modulepreload`))return;for(let e of document.querySelectorAll(`link[rel="modulepreload"]`))n(e);new MutationObserver(e=>{for(let t of e)if(t.type===`childList`)for(let e of t.addedNodes)e.tagName===`LINK`&&e.rel===`modulepreload`&&n(e)}).observe(document,{childList:!0,subtree:!0});function t(e){let t={};return e.integrity&&(t.integrity=e.integrity),e.referrerPolicy&&(t.referrerPolicy=e.referrerPolicy),t.credentials=e.crossOrigin===`use-credentials`?`include`:e.crossOrigin===`anonymous`?`omit`:`same-origin`,t}function n(e){if(e.ep)return;e.ep=!0;let n=t(e);fetch(e.href,n)}})();var e=`struct Params {
+  nx: u32, ny: u32, newtonMaxIter: u32, bcMode: u32, /* 0: channel (dynamic left/right), 2: closed box (slip walls) */
+  dx: f32, dy: f32, x0: f32, y0: f32,
+  gamma: f32, refRho: f32, relaxSmall: f32, relaxLarge: f32,
+  cfl: f32, evc: f32, relaxFactor: f32, newtonTol: f32,
+  omegaInv: f32, openTB: f32, p2: f32, p3: f32,  /* openTB = 1: dynamic (open) top/bottom boundaries */
+  inflow: vec4f,  /* conserved background state at the ground (rho, m_x, m_y, E); the Dirichlet data is B0 */
+  body: vec4f,    /* body (center x, center y, size r, enabled) */
+  bodyVel: vec4f, /* body velocity (v_x, v_y, angular velocity omega, 0) */
+  grav: vec4f,    /* (gravity g, fixed tau (0: from the CFL condition), 0, 0) */
+  sponge: vec4f,  /* Rayleigh damping toward B0: (top layer start y, left layer end x, right layer start x, strength) */
+  shape: vec4f,   /* (shape id, angle [rad], 0, 0); see shape.wgsl */
+  naca: vec4f,    /* NACA 4-digit: (max camber m, its position p, thickness t, 0) */
+};
+
+@group(0) @binding(0) var<uniform> P: Params;
+`,t=`/* Shared by every solver kernel. The prelude (const EPS, const WG) is
+ * generated in shaders.ts; Params and the P binding come from params.wgsl.
+ *
+ * Port of ryujin's Euler module (source/euler/: hyperbolic_system.h,
+ * indicator.h, limiter.h, wave_speed_estimator.h with the polytropic-gas
+ * specialization of euler_aeos/nasg_riemann_solver.h). Function names and
+ * the order of operations follow the C++ code; comments point at it. */
+
+struct Stage { s: u32, inSlot: u32, outSlot: u32, nst: u32, slotA: u32, slotB: u32, wA: f32, wB: f32 };
+
+/* Per-run counters. Kernels that update them bind \`info: Info\` (atomic);
+ * read-only kernels bind \`info: InfoR\` (same layout).
+ *   loViol:  limit() reported success == false (ryujin: restart_needed)
+ *   admViol: high-order state fails is_admissible() (ryujin: restart_needed)
+ *   stViol:  tau of a later ERK stage too large for that stage's CFL bound */
+struct Info { tauMin: atomic<u32>, tau: f32, time: f32, steps: u32, loViol: atomic<u32>, stViol: u32, admViol: atomic<u32>, p1: u32 };
+struct InfoR { tauMin: u32, tau: f32, time: f32, steps: u32, loViol: u32, stViol: u32, admViol: u32, p1: u32 };
+
+/* Precomputed geometry of the current mesh (geom.wgsl, rebuilt whenever
+ * the body or the obstacles change):
+ *   NF[i] bits 0..7: j = i + offk(k) is in the sparsity pattern of row i
+ *         bit 8: node i is active (has a fluid cell), bit 9: boundary dof,
+ *         bit 10: adjacent to a body cell (slip with the shape normal)
+ *   CM[9 i + k] = (c_ij, m_ij, 0) for j = i + offk(k), k < 8
+ *   CM[9 i + 8] = (c_ii, m_i, 0) */
+@group(0) @binding(14) var<storage, read> NF: array<u32>;
+@group(0) @binding(15) var<storage, read> CM: array<vec4f>;
+
+const FMIN: f32 = 1.17549435e-38;
+const FMAX: f32 = 0x1.fffffep+127f;
+
+fn NN() -> u32 { return P.nx * P.ny; }
+
+fn nodeIdx(ix: i32, iy: i32) -> u32 { return u32(iy) * P.nx + u32(ix); }
+/* neighbor k in 0..7 (center skipped); reverse(k) = 7 - k */
+fn offk(k: u32) -> vec2i {
+  var idx = k;
+  if (k >= 4u) { idx = k + 1u; }
+  return vec2i(i32(idx % 3u) - 1, i32(idx / 3u) - 1);
+}
+/* inverse of offk; (0, 0) maps to 8 (the diagonal entry) */
+fn kOf(a: i32, b: i32) -> u32 {
+  let idx = u32((b + 1) * 3 + (a + 1));
+  if (idx == 4u) { return 8u; }
+  return select(idx - 1u, idx, idx < 4u);
+}
+fn nflags(ix: i32, iy: i32) -> u32 { return NF[nodeIdx(ix, iy)]; }
+fn isActive(ix: i32, iy: i32) -> bool { return (nflags(ix, iy) & 0x100u) != 0u; }
+fn onB(ix: i32, iy: i32) -> bool { return (nflags(ix, iy) & 0x200u) != 0u; }
+fn bodyAdj(ix: i32, iy: i32) -> bool { return (nflags(ix, iy) & 0x400u) != 0u; }
+fn coupled(ix: i32, iy: i32, o: vec2i) -> bool { return (nflags(ix, iy) & (1u << kOf(o.x, o.y))) != 0u; }
+fn rowLen(ix: i32, iy: i32) -> f32 { return 1.0 + f32(countOneBits(nflags(ix, iy) & 0xffu)); }
+fn cvec(ix: i32, iy: i32, a: i32, b: i32) -> vec2f { return CM[9u * nodeIdx(ix, iy) + kOf(a, b)].xy; }
+fn mcons(ix: i32, iy: i32, a: i32, b: i32) -> f32 { return CM[9u * nodeIdx(ix, iy) + kOf(a, b)].z; }
+fn mlump(ix: i32, iy: i32) -> f32 { return CM[9u * nodeIdx(ix, iy) + 8u].z; }
+/* nu_i = int_{boundary} phi_i n = sum_j c_ji (outward from the fluid): ryujin's boundary normal */
+fn boundaryNormal(ix: i32, iy: i32) -> vec2f {
+  var nu = cvec(ix, iy, 0, 0);
+  for (var k = 0u; k < 8u; k++) {
+    let o = offk(k);
+    if (!coupled(ix, iy, o)) { continue; }
+    nu += CM[9u * nodeIdx(ix + o.x, iy + o.y) + (7u - k)].xy;
+  }
+  return nu;
+}
+
+/* ---------------------------------------------------------------------------
+ * HyperbolicSystemView (euler/hyperbolic_system.h). U = (rho, m_x, m_y, E).
+ * ------------------------------------------------------------------------- */
+fn gammaInv() -> f32 { return 1.0 / P.gamma; }
+fn gammaPlusOneInv() -> f32 { return 1.0 / (P.gamma + 1.0); }
+
+fn filterVacuumDensity(rho: f32) -> f32 {
+  let cutoff = P.refRho * P.relaxLarge * EPS;
+  return select(rho, 0.0, abs(rho) < cutoff);
+}
+fn internalEnergy(U: vec4f) -> f32 {
+  /* rho e = (E - 1/2*m^2/rho) */
+  let rhoInv = 1.0 / U.x;
+  return U.w - 0.5 * dot(U.yz, U.yz) * rhoInv;
+}
+fn internalEnergyDerivative(U: vec4f) -> vec4f {
+  /* (rho e)' = (1/2 m^2/rho^2, -m/rho, 1)^T */
+  let u = U.yz / U.x;
+  return vec4f(0.5 * dot(u, u), -u, 1.0);
+}
+fn pressure(U: vec4f) -> f32 { return (P.gamma - 1.0) * internalEnergy(U); }
+fn speedOfSound(U: vec4f) -> f32 { return sqrt(P.gamma * pressure(U) / U.x); }
+fn specificEntropy(U: vec4f) -> f32 {
+  /* exp((gamma - 1)s) = (rho e) / rho ^ gamma */
+  return internalEnergy(U) * pow(1.0 / U.x, P.gamma);
+}
+fn hartenEntropy(U: vec4f) -> f32 {
+  /* (rho^2 e) ^ 1/(gamma+1),  rho^2 e = rho E - 1/2 m^2 */
+  let rre = U.x * U.w - 0.5 * dot(U.yz, U.yz);
+  return pow(rre, gammaPlusOneInv());
+}
+fn hartenEntropyDerivative(U: vec4f) -> vec4f {
+  /* eta' = 1/(gamma+1) (rho^2 e) ^ -gamma/(gamma+1) (E, -m, rho)^T */
+  let rre = U.x * U.w - 0.5 * dot(U.yz, U.yz);
+  let factor = gammaPlusOneInv() * pow(rre, -P.gamma * gammaPlusOneInv());
+  return vec4f(factor * U.w, -factor * U.yz, factor * U.x);
+}
+fn isAdmissible(U: vec4f) -> bool {
+  return U.x > 0.0 && internalEnergy(U) > 0.0 && specificEntropy(U) > 0.0;
+}
+/* f(U) . c */
+fn fC(U: vec4f, c: vec2f) -> vec4f {
+  let rhoInv = 1.0 / U.x;
+  let m = U.yz;
+  let p = pressure(U);
+  let mc = dot(m, c);
+  return vec4f(mc, m.x * rhoInv * mc + p * c.x, m.y * rhoInv * mc + p * c.y, rhoInv * (U.w + p) * mc);
+}
+/* flux_divergence = -(f(U_i) + f(U_j)) . c_ij */
+fn fluxDiv(Ui: vec4f, Uj: vec4f, c: vec2f) -> vec4f { return -(fC(Ui, c) + fC(Uj, c)); }
+
+fn fromPrimitive(rho: f32, v: vec2f, p: f32) -> vec4f {
+  return vec4f(rho, rho * v, p / (P.gamma - 1.0) + 0.5 * rho * dot(v, v));
+}
+
+/* ---------------------------------------------------------------------------
+ * WaveSpeedEstimator (euler/wave_speed_estimator.h) -> NASGRiemannSolverView
+ * (euler_aeos/nasg_riemann_solver.h) with covolume = pinf = safe_division =
+ * variable_gamma = false and newton_max_iterations = 0 (the default), i.e.
+ * compute() = compute_lambda_max(p_star_upper_bound(phi_of_p_max)).
+ * Riemann data rd = (rho, u, p, a).
+ * ------------------------------------------------------------------------- */
+fn riemannData(U: vec4f, n: vec2f) -> vec4f {
+  let rho = U.x;
+  let rhoInv = 1.0 / rho;
+  let projM = dot(n, U.yz);
+  let perp = U.yz - projM * n;
+  let E = U.w - 0.5 * dot(perp, perp) * rhoInv;
+  let ie = E - 0.5 * projM * projM * rhoInv;
+  let p = (P.gamma - 1.0) * ie;
+  let a = sqrt(P.gamma * p * rhoInv);
+  return vec4f(rho, projM * rhoInv, p, a);
+}
+/* c(gamma), (A.3) of Clayton-Guermond-Popov 2022 with the gamma > 3 cut-off */
+fn cOfGamma(g: f32) -> f32 {
+  let slope = -0.34976871477801828189920753948709;
+  let r1 = (3.0 * g + 11.0) / (6.0 * g + 6.0);
+  let r2 = 5.0 / 6.0 + slope * (g - 3.0);
+  var r = min(r1, r2);
+  r = min(1.0, r);
+  r = max(0.5, r);
+  return sqrt(r);
+}
+fn phiOfPMax(ri: vec4f, rj: vec4f) -> f32 {
+  let g = P.gamma;
+  let pmax = max(ri.z, rj.z);
+  let rii = 0.5 * ri.x * ((g + 1.0) * pmax + (g - 1.0) * ri.z);
+  let vi = (pmax - ri.z) / sqrt(rii);
+  let rij = 0.5 * rj.x * ((g + 1.0) * pmax + (g - 1.0) * rj.z);
+  let vj = (pmax - rj.z) / sqrt(rij);
+  return vi + vj + rj.y - ri.y;
+}
+fn pStarSingleGamma(ri: vec4f, rj: vec4f, phiPMax: f32) -> f32 {
+  let g = P.gamma;
+  let cg = cOfGamma(g);
+  let alphaI = ri.w;
+  let alphaJ = rj.w;
+  let pmin = min(ri.z, rj.z);
+  let pmax = max(ri.z, rj.z);
+  let alphaMin = select(alphaJ, alphaI, ri.z < rj.z);
+  let alphaMax = select(alphaJ, alphaI, ri.z >= rj.z);
+  let alphaHatMin = cg * alphaMin;
+  let alphaSel = select(alphaMax, cg * alphaMax, phiPMax < 0.0);
+  let e = 0.5 * (g - 1.0) / g;
+  let eInv = 2.0 * g / (g - 1.0);
+  let num = max(0.0, alphaHatMin + alphaSel - 0.5 * (g - 1.0) * (rj.y - ri.y));
+  let den = alphaHatMin * pow(pmin / pmax, -e) + alphaSel;
+  return pmax * pow(num / den, eInv);
+}
+fn pStarFailsafe(ri: vec4f, rj: vec4f) -> f32 {
+  let g = P.gamma;
+  let pmax = max(ri.z, rj.z);
+  let radI = 2.0 * pmax / (ri.x * ((g + 1.0) * pmax + (g - 1.0) * ri.z));
+  let xi = sqrt(radI);
+  let radJ = 2.0 * pmax / (rj.x * ((g + 1.0) * pmax + (g - 1.0) * rj.z));
+  let xj = sqrt(radJ);
+  let a = xi + xj;
+  let b = select(rj.y - ri.y, 0.0, a == 0.0);
+  let c = -ri.z * xi - rj.z * xj;
+  let base = abs(-b + sqrt(max(0.0, b * b - 4.0 * a * c))) / abs(2.0 * a);
+  return base * base;
+}
+fn pStarUpperBound(ri: vec4f, rj: vec4f, phiPMax: f32) -> f32 {
+  let pmax = max(ri.z, rj.z);
+  let pTilde = pStarSingleGamma(ri, rj, phiPMax);
+  let pBackup = pStarFailsafe(ri, rj);
+  return select(min(pmax, pTilde), min(pTilde, pBackup), phiPMax < 0.0);
+}
+fn lambda1Minus(r: vec4f, pStar: f32) -> f32 {
+  let factor = 0.5 * (P.gamma + 1.0) / P.gamma;
+  let tmp = max(0.0, pStar - r.z) / r.z;
+  return r.y - r.w * sqrt(1.0 + factor * tmp);
+}
+fn lambda3Plus(r: vec4f, pStar: f32) -> f32 {
+  let factor = 0.5 * (P.gamma + 1.0) / P.gamma;
+  let tmp = max(0.0, pStar - r.z) / r.z;
+  return r.y + r.w * sqrt(1.0 + factor * tmp);
+}
+fn lambdaMax(Ui: vec4f, Uj: vec4f, n: vec2f) -> f32 {
+  let ri = riemannData(Ui, n);
+  let rj = riemannData(Uj, n);
+  let phiPMax = phiOfPMax(ri, rj);
+  let p2 = pStarUpperBound(ri, rj, phiPMax);
+  let nu11 = lambda1Minus(ri, p2);
+  let nu32 = lambda3Plus(rj, p2);
+  return max(max(0.0, nu32), -min(0.0, nu11));
+}
+
+/* ---------------------------------------------------------------------------
+ * Limiter (euler/limiter.h). Bounds = (rho_min, rho_max, s_min).
+ * ------------------------------------------------------------------------- */
+struct LimAcc { b: vec3f, rnum: f32, rden: f32, sInterpMax: f32 };
+
+fn limReset() -> LimAcc { return LimAcc(vec3f(FMAX, 0.0, FMAX), 0.0, 0.0, 0.0); }
+
+/* accumulate(): sJ is the precomputed specific entropy of U_j; the affine
+ * shift is identically zero for the Euler equations. */
+fn limAccumulate(acc: ptr<function, LimAcc>, Ui: vec4f, Uj: vec4f, sJ: f32, sc: vec2f) {
+  let rhoBar = 0.5 * (Ui.x + Uj.x + dot(Ui.yz - Uj.yz, sc));
+  (*acc).b.x = min((*acc).b.x, rhoBar);
+  (*acc).b.y = max((*acc).b.y, rhoBar);
+  (*acc).b.z = min((*acc).b.z, sJ);
+  /* NOTE: copied as is from ryujin; the numerator sums rho_i + rho_j (not a difference). */
+  (*acc).rnum += Ui.x + Uj.x;
+  (*acc).rden += 1.0;
+  (*acc).sInterpMax = max((*acc).sInterpMax, specificEntropy(0.5 * (Ui + Uj)));
+}
+
+fn limBounds(acc: LimAcc, hd: f32) -> vec3f {
+  /* fully_relax_bounds: r = factor * (m_i / |Omega|) ^ (3/4) in 2D */
+  var r = sqrt(hd);
+  let q = sqrt(r); r = q * q * q;
+  r *= P.relaxFactor;
+  var rb = vec3f(acc.b.x * max(1.0 - r, EPS), acc.b.y * (1.0 + r), acc.b.z * max(1.0 - r, EPS));
+  /* stricter window */
+  let rhoRel = 2.0 * P.relaxFactor * abs(acc.rnum) / (abs(acc.rden) + EPS);
+  let sRel = P.relaxFactor * (acc.sInterpMax - acc.b.z);
+  rb.x = max(rb.x, acc.b.x - rhoRel);
+  rb.y = min(rb.y, acc.b.y + rhoRel);
+  rb.z = max(rb.z, acc.b.z - sRel);
+  return rb;
+}
+
+/* newton.h: quadratic_newton_step */
+fn quadNewton(p1: ptr<function, f32>, p2: ptr<function, f32>, phi1: f32, phi2: f32,
+              dphi1: f32, dphi2: f32, sgn: f32) {
+  let scaling = 1.0 / (*p2 - *p1 + EPS);
+  let dd11 = dphi1;
+  let dd12 = (phi2 - phi1) * scaling;
+  let dd22 = dphi2;
+  let dd112 = (dd12 - dd11) * scaling;
+  let dd122 = (dd22 - dd12) * scaling;
+  let disc1 = abs(dphi1 * dphi1 - 4.0 * phi1 * dd112);
+  let disc2 = abs(dphi2 * dphi2 - 4.0 * phi2 * dd122);
+  let den1 = dphi1 + sgn * sqrt(disc1);
+  let den2 = dphi2 + sgn * sqrt(disc2);
+  var t1 = *p1 - select(2.0 * phi1 / den1, 0.0, abs(den1) < EPS);
+  var t2 = *p2 - select(2.0 * phi2 / den2, 0.0, abs(den2) < EPS);
+  t1 = min(*p2, max(*p1, t1));
+  t2 = min(*p2, max(*p1, t2));
+  *p1 = min(t1, t2);
+  *p2 = max(t1, t2);
+}
+
+/* limit(bounds, U, P) with t_min = 0, t_max = 1; returns (t, success). */
+fn limit(bnd: vec3f, U: vec4f, Pv: vec4f) -> vec2f {
+  var success = 1.0;
+  var tr = 1.0;
+  let relaxS = 1.0 + P.relaxSmall * EPS;
+  let relax = 1.0 + P.relaxLarge * EPS;
+
+  /* First limit the density rho: */
+  {
+    let rhoU = U.x; let rhoP = Pv.x;
+    let rhoMin = bnd.x; let rhoMax = bnd.y;
+    let testMin = filterVacuumDensity(max(0.0, rhoU - relax * rhoMax));
+    let testMax = filterVacuumDensity(max(0.0, rhoMin - relax * rhoU));
+    if (!(testMin == 0.0 && testMax == 0.0)) { success = 0.0; }
+    let den = 1.0 / (abs(rhoP) + EPS * rhoMax);
+    tr = select(tr, (rhoMax - rhoU) * den, rhoMax < rhoU + tr * rhoP);
+    tr = select(tr, (rhoU - rhoMin) * den, rhoU + tr * rhoP < rhoMin);
+    tr = min(tr, 1.0);
+    tr = max(tr, 0.0);
+  }
+
+  /* Then limit the specific entropy psi = rho * rho e - s_min * rho^(gamma + 1): */
+  var tl = 0.0;
+  let g = P.gamma;
+  let gp1 = g + 1.0;
+  let sMin = bnd.z;
+  for (var n = 0u; n < P.newtonMaxIter; n++) {
+    let Ur = U + tr * Pv;
+    let rhoR = Ur.x;
+    let rhoRG = pow(rhoR, g);
+    let reR = internalEnergy(Ur);
+    let psiR = relaxS * rhoR * reR - sMin * rhoR * rhoRG;
+    /* If psi_r > 0 the right state is fine, force returning t_r: */
+    tl = select(tl, tr, psiR > 0.0);
+    if (tl == tr) { break; }
+    let Ul = U + tl * Pv;
+    let rhoL = Ul.x;
+    let rhoLG = pow(rhoL, g);
+    let reL = internalEnergy(Ul);
+    let psiL = relaxS * rhoL * reL - sMin * rhoL * rhoLG;
+    let lower = (1.0 - relax) * sMin * rhoL * rhoLG;
+    if (n == 0u && !(min(0.0, psiL - lower) == 0.0)) { success = 0.0; }
+    if (max(0.0, tr - tl - P.newtonTol) == 0.0) { break; }
+    /* Quadratic Newton step: */
+    let drho = Pv.x;
+    let dreL = dot(internalEnergyDerivative(Ul), Pv);
+    let dreR = dot(internalEnergyDerivative(Ur), Pv);
+    let dpsiL = rhoL * dreL + (reL - gp1 * sMin * rhoLG) * drho;
+    let dpsiR = rhoR * dreR + (reR - gp1 * sMin * rhoRG) * drho;
+    var a = tl; var b = tr;
+    quadNewton(&a, &b, psiL, psiR, dpsiL, dpsiR, -1.0);
+    tl = a; tr = b;
+  }
+  return vec2f(tl, success);
+}
+`,n=`/* Body geometry as a signed distance function (negative inside), in world
+ * units. Shapes are defined in units of the size r = P.body.z around the
+ * center P.body.xy and rotated by the angle P.shape.y (counterclockwise;
+ * a positive angle of attack pitches the nose up, i.e. the body is rotated
+ * clockwise).
+ *   0 cylinder:      radius r
+ *   1 square:        half side 0.9 r
+ *   2 wedge:         15 degree half angle, apex upstream, length 2 r
+ *   3 double wedge:  diamond airfoil, chord 3.2 r, thickness 12% of chord
+ *   4 NACA 4-digit:  chord 3.2 r (euler geometries/geometry_airfoil.h formulas) */
+fn sdBox(p: vec2f, b: vec2f) -> f32 {
+  let d = abs(p) - b;
+  return length(max(d, vec2f(0.0))) + min(max(d.x, d.y), 0.0);
+}
+/* signed distance to a triangle (Inigo Quilez, MIT) */
+fn sdTriangle(p: vec2f, p0: vec2f, p1: vec2f, p2: vec2f) -> f32 {
+  let e0 = p1 - p0; let e1 = p2 - p1; let e2 = p0 - p2;
+  let v0 = p - p0; let v1 = p - p1; let v2 = p - p2;
+  let pq0 = v0 - e0 * clamp(dot(v0, e0) / dot(e0, e0), 0.0, 1.0);
+  let pq1 = v1 - e1 * clamp(dot(v1, e1) / dot(e1, e1), 0.0, 1.0);
+  let pq2 = v2 - e2 * clamp(dot(v2, e2) / dot(e2, e2), 0.0, 1.0);
+  let s = sign(e0.x * e2.y - e0.y * e2.x);
+  let d = min(min(vec2f(dot(pq0, pq0), s * (v0.x * e0.y - v0.y * e0.x)),
+                  vec2f(dot(pq1, pq1), s * (v1.x * e1.y - v1.y * e1.x))),
+                  vec2f(dot(pq2, pq2), s * (v2.x * e2.y - v2.y * e2.x)));
+  return -sqrt(d.x) * sign(d.y);
+}
+/* signed distance to a rhombus with half diagonals b (Inigo Quilez, MIT) */
+fn sdRhombus(p0: vec2f, b: vec2f) -> f32 {
+  let p = abs(p0);
+  let ndot = b.x * (b.x - 2.0 * p.x) - b.y * (b.y - 2.0 * p.y);
+  let h = clamp(ndot / dot(b, b), -1.0, 1.0);
+  let d = length(p - 0.5 * b * vec2f(1.0 - h, 1.0 + h));
+  return d * sign(p.x * b.y + p.y * b.x - b.x * b.y);
+}
+/* NACA 4-digit in chord units (leading edge at 0, trailing edge at 1):
+ * a pseudo distance |y - y_c(x)| - y_t(x), continued by the distance to the
+ * leading/trailing edge outside [0, 1]. Correct sign, smooth enough for normals. */
+fn sdNaca(q: vec2f) -> f32 {
+  let m = P.naca.x; let pp = P.naca.y; let t = P.naca.z;
+  if (q.x <= 0.0) { return length(q); }
+  if (q.x >= 1.0) { return length(q - vec2f(1.0, 0.0)); }
+  let x = q.x;
+  let yt = 5.0 * t * (0.2969 * sqrt(x) + x * (-0.126 + x * (-0.3516 + x * (0.2843 + x * (-0.1036)))));
+  var yc = 0.0;
+  if (m > 0.0) {
+    if (x < pp) { yc = m / (pp * pp) * (2.0 * pp * x - x * x); }
+    else { yc = m / ((1.0 - pp) * (1.0 - pp)) * (1.0 - 2.0 * pp + 2.0 * pp * x - x * x); }
+  }
+  return abs(q.y - yc) - yt;
+}
+fn bodySD(x: vec2f) -> f32 {
+  let r = P.body.z;
+  let a = P.shape.y;
+  let d = x - P.body.xy;
+  /* rotate into the body frame (by -angle) and scale to units of r */
+  let ca = cos(a); let sa = sin(a);
+  let q = vec2f(ca * d.x + sa * d.y, -sa * d.x + ca * d.y) / r;
+  let id = u32(P.shape.x + 0.5);
+  var s: f32;
+  if (id == 1u) {
+    s = sdBox(q, vec2f(0.9));
+  } else if (id == 2u) {
+    let tn = tan(15.0 * 3.14159265358979 / 180.0);
+    s = sdTriangle(q, vec2f(-1.2, 0.0), vec2f(0.8, -2.0 * tn), vec2f(0.8, 2.0 * tn));
+  } else if (id == 3u) {
+    s = sdRhombus(q, vec2f(1.6, 0.192));
+  } else if (id == 4u) {
+    /* chord 3.2 r, centered at mid chord */
+    s = 3.2 * sdNaca(q / 3.2 + vec2f(0.5, 0.0));
+  } else {
+    s = length(q) - 1.0;
+  }
+  return s * r;
+}
+/* outward normal from central differences of the distance function */
+fn bodyNormal(x: vec2f) -> vec2f {
+  let h = 0.25 * min(P.dx, P.dy);
+  let g = vec2f(bodySD(x + vec2f(h, 0.0)) - bodySD(x - vec2f(h, 0.0)),
+                bodySD(x + vec2f(0.0, h)) - bodySD(x - vec2f(0.0, h)));
+  let l = length(g);
+  return select(vec2f(1.0, 0.0), g / l, l > 0.0);
+}
+/* surface velocity of the body at x: translation plus rotation */
+fn bodySurfaceVel(x: vec2f) -> vec2f {
+  let d = x - P.body.xy;
+  return P.bodyVel.xy + P.bodyVel.z * vec2f(-d.y, d.x);
+}
+`,r=`/* Cell mask (assembled WITHOUT common.wgsl): 1 fluid, 0 body, 2 painted
+ * obstacle (O[cell] != 0). A cell belongs to the body if the shape
+ * (shape.wgsl) covers at least half of it, measured with 4 x 4 samples;
+ * thin slivers (e.g. sharp leading edges) thus stay fluid instead of
+ * turning into blunt one-cell steps. */
+@group(0) @binding(1) var<storage, read_write> MW: array<u32>;
+@group(0) @binding(2) var<storage, read> O: array<u32>;
+@compute @workgroup_size(WG, WG)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let ncx = P.nx - 1u; let ncy = P.ny - 1u;
+  if (gid.x >= ncx || gid.y >= ncy) { return; }
+  let c = vec2f(P.x0 + (f32(gid.x) + 0.5) * P.dx, P.y0 + (f32(gid.y) + 0.5) * P.dy);
+  let k = gid.y * ncx + gid.x;
+  var m = 1u;
+  var covered = 0u;
+  if (P.body.w > 0.5 && bodySD(c) < 0.75 * max(P.dx, P.dy)) {
+    for (var t = 0u; t < 16u; t++) {
+      let o = vec2f((f32(t & 3u) - 1.5) / 4.0 * P.dx, (f32(t >> 2u) - 1.5) / 4.0 * P.dy);
+      if (bodySD(c + o) < 0.0) { covered += 1u; }
+    }
+  }
+  if (covered >= 8u) { m = 0u; }
+  else if (O[k] != 0u) { m = 2u; }
+  MW[k] = m;
+}
+`,i=`/* Second mask pass (assembled WITHOUT common.wgsl): remove solid cells that
+ * form one-cell-thick strips, i.e. that have fluid on both sides vertically
+ * or horizontally (cells outside the domain count as solid). Flow wrapping
+ * around the end of such a zero-thickness plate expands to near vacuum,
+ * where FP32 cannot keep the internal energy positive. Thin trailing edges
+ * and thin painted lines therefore end a cell early instead. */
+@group(0) @binding(1) var<storage, read_write> MW: array<u32>;
+@group(0) @binding(2) var<storage, read> MR: array<u32>;
+fn raw(cx: i32, cy: i32) -> u32 {
+  if (cx < 0 || cy < 0 || cx >= i32(P.nx) - 1 || cy >= i32(P.ny) - 1) { return 0u; }
+  return MR[u32(cy) * (P.nx - 1u) + u32(cx)];
+}
+@compute @workgroup_size(WG, WG)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let ncx = P.nx - 1u; let ncy = P.ny - 1u;
+  if (gid.x >= ncx || gid.y >= ncy) { return; }
+  let cx = i32(gid.x); let cy = i32(gid.y);
+  var m = raw(cx, cy);
+  if (m != 1u) {
+    let thinV = raw(cx, cy - 1) == 1u && raw(cx, cy + 1) == 1u;
+    let thinH = raw(cx - 1, cy) == 1u && raw(cx + 1, cy) == 1u;
+    if (thinV || thinH) { m = 1u; }
+  }
+  MW[gid.y * ncx + gid.x] = m;
+}
+`,a=`/* Mask-based assembly of the cG Q1 matrices; only used by geom.wgsl.
+ * Cell mask: M[cy * (nx - 1) + cx] = 1 fluid, 0 body, 2 painted obstacle. */
+@group(0) @binding(1) var<storage, read> M: array<u32>;
+
+const FMIN: f32 = 1.17549435e-38;
+const FMAX: f32 = 0x1.fffffep+127f;
+
+fn NN() -> u32 { return P.nx * P.ny; }
+
+/* ---------------------------------------------------------------------------
+ * cG Q1 on the uniform grid with cells removed (the "mesh" is the set of
+ * fluid cells). All matrices are assembled on the fly from the bilinear
+ * element matrices of the fluid cells that contain both nodes, i.e. exactly
+ * what ryujin's OfflineData would assemble on that mesh:
+ *   c_ij = int phi_i grad phi_j,  m_ij = int phi_i phi_j,  m_i = int phi_i.
+ * ------------------------------------------------------------------------- */
+fn cellFluid(cx: i32, cy: i32) -> bool {
+  if (cx < 0 || cy < 0 || cx >= i32(P.nx) - 1 || cy >= i32(P.ny) - 1) { return false; }
+  return M[u32(cy) * (P.nx - 1u) + u32(cx)] == 1u;
+}
+fn cellBody(cx: i32, cy: i32) -> bool {
+  if (cx < 0 || cy < 0 || cx >= i32(P.nx) - 1 || cy >= i32(P.ny) - 1) { return false; }
+  return M[u32(cy) * (P.nx - 1u) + u32(cx)] == 0u;
+}
+/* 1D element matrices on [0, h], local node a, b in {0, 1}:
+ * int phi_a phi_b = h/3 (a == b), h/6 (a != b);  int phi_a phi_b' = -1/2 (b = 0), +1/2 (b = 1). */
+fn Mloc(a: i32, b: i32, h: f32) -> f32 { return select(h / 6.0, h / 3.0, a == b); }
+fn Cloc(b: i32) -> f32 { return select(-0.5, 0.5, b == 1); }
+
+/* Number of fluid cells adjacent to node (ix, iy). */
+fn nFluid(ix: i32, iy: i32) -> u32 {
+  var n = 0u;
+  if (cellFluid(ix - 1, iy - 1)) { n += 1u; }
+  if (cellFluid(ix, iy - 1)) { n += 1u; }
+  if (cellFluid(ix - 1, iy)) { n += 1u; }
+  if (cellFluid(ix, iy)) { n += 1u; }
+  return n;
+}
+fn isActive(ix: i32, iy: i32) -> bool { return nFluid(ix, iy) > 0u; }
+/* Boundary degree of freedom of the fluid mesh (outer edges and body). */
+fn onB(ix: i32, iy: i32) -> bool { return nFluid(ix, iy) < 4u; }
+
+/* The (up to four) cells adjacent to node i are (ix - 1 + (t & 1), iy - 1 + (t >> 1)),
+ * t = 0..3. A cell contains node j = i + o iff the local index of j is in {0, 1}^2.
+ * Fixed trip-count loops (data dependent loop bounds hang Intel's Metal compiler). */
+fn cellOf(ix: i32, iy: i32, t: u32) -> vec2i { return vec2i(ix - 1 + i32(t & 1u), iy - 1 + i32(t >> 1u)); }
+fn holds(cell: vec2i, jx: i32, jy: i32) -> bool {
+  let l = vec2i(jx, jy) - cell;
+  return l.x >= 0 && l.x <= 1 && l.y >= 0 && l.y <= 1;
+}
+
+/* c_ij (j = i + (a, b), |a|, |b| <= 1) and m_ij summed over the fluid cells that contain both nodes. */
+fn cvec(ix: i32, iy: i32, a: i32, b: i32) -> vec2f {
+  var c = vec2f(0.0);
+  let jx = ix + a; let jy = iy + b;
+  for (var t = 0u; t < 4u; t++) {
+    let cl = cellOf(ix, iy, t);
+    if (!holds(cl, jx, jy) || !cellFluid(cl.x, cl.y)) { continue; }
+    let ax = ix - cl.x; let ay = iy - cl.y; let bx = jx - cl.x; let by = jy - cl.y;
+    c += vec2f(Cloc(bx) * Mloc(ay, by, P.dy), Mloc(ax, bx, P.dx) * Cloc(by));
+  }
+  return c;
+}
+fn mcons(ix: i32, iy: i32, a: i32, b: i32) -> f32 {
+  var m = 0.0;
+  let jx = ix + a; let jy = iy + b;
+  for (var t = 0u; t < 4u; t++) {
+    let cl = cellOf(ix, iy, t);
+    if (!holds(cl, jx, jy) || !cellFluid(cl.x, cl.y)) { continue; }
+    m += Mloc(ix - cl.x, jx - cl.x, P.dx) * Mloc(iy - cl.y, jy - cl.y, P.dy);
+  }
+  return m;
+}
+fn mlump(ix: i32, iy: i32) -> f32 { return f32(nFluid(ix, iy)) * 0.25 * P.dx * P.dy; }
+
+/* j = i + o is in the sparsity pattern of row i: the two nodes share a fluid cell. */
+fn coupled(ix: i32, iy: i32, o: vec2i) -> bool {
+  for (var t = 0u; t < 4u; t++) {
+    let cl = cellOf(ix, iy, t);
+    if (holds(cl, ix + o.x, iy + o.y) && cellFluid(cl.x, cl.y)) { return true; }
+  }
+  return false;
+}
+/* neighbor k in 0..7 (center skipped); reverse(k) = 7 - k */
+fn offk(k: u32) -> vec2i {
+  var idx = k;
+  if (k >= 4u) { idx = k + 1u; }
+  return vec2i(i32(idx % 3u) - 1, i32(idx / 3u) - 1);
+}
+fn rowLen(ix: i32, iy: i32) -> f32 {
+  var n = 1.0;
+  for (var k = 0u; k < 8u; k++) { if (coupled(ix, iy, offk(k))) { n += 1.0; } }
+  return n;
+}
+
+`,o=`/* Precompute the geometry buffers NF and CM (see common.wgsl) from the cell
+ * mask. Assembled as prelude + params + shape + assemble.wgsl + this file. */
+@group(0) @binding(2) var<storage, read_write> NFW: array<u32>;
+@group(0) @binding(3) var<storage, read_write> CMW: array<vec4f>;
+@compute @workgroup_size(WG, WG)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= P.nx || gid.y >= P.ny) { return; }
+  let ix = i32(gid.x); let iy = i32(gid.y);
+  let i = gid.y * P.nx + gid.x;
+  let nf = nFluid(ix, iy);
+  var flags = 0u;
+  if (nf > 0u) { flags |= 0x100u; }
+  if (nf > 0u && nf < 4u) { flags |= 0x200u; }
+  if (cellBody(ix - 1, iy - 1) || cellBody(ix, iy - 1) || cellBody(ix - 1, iy) || cellBody(ix, iy)) { flags |= 0x400u; }
+  for (var k = 0u; k < 8u; k++) {
+    let o = offk(k);
+    var e = vec4f(0.0);
+    if (nf > 0u && coupled(ix, iy, o)) {
+      flags |= 1u << k;
+      e = vec4f(cvec(ix, iy, o.x, o.y), mcons(ix, iy, o.x, o.y), 0.0);
+    }
+    CMW[9u * i + k] = e;
+  }
+  CMW[9u * i + 8u] = vec4f(cvec(ix, iy, 0, 0), mlump(ix, iy), 0.0);
+  NFW[i] = flags;
+}
+`,s={MASK:r,CLEAN:i,GEOM:o,FILL:`/* After the terrain changed: nodes that became active get the background
+ * state B0 (NOT part of ryujin, whose mesh is fixed). A neighbor average
+ * would mix states from different heights, which is not in hydrostatic
+ * balance. A[i] holds the activity of node i before the change;
+ * commit.wgsl updates it afterwards. */
+@group(0) @binding(1) var<storage, read_write> S: array<vec4f>;
+@group(0) @binding(2) var<storage, read> A: array<u32>;
+@group(0) @binding(3) var<storage, read> B0: array<vec4f>;
+@compute @workgroup_size(WG, WG)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= P.nx || gid.y >= P.ny) { return; }
+  let ix = i32(gid.x); let iy = i32(gid.y);
+  let i = gid.y * P.nx + gid.x;
+  if (!isActive(ix, iy) || A[i] != 0u) { return; }
+  S[i] = B0[i];
+}
+`,COMMIT:`@group(0) @binding(1) var<storage, read_write> A: array<u32>;
+@compute @workgroup_size(WG, WG)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= P.nx || gid.y >= P.ny) { return; }
+  A[gid.y * P.nx + gid.x] = select(0u, 1u, isActive(i32(gid.x), i32(gid.y)));
+}
+`,BC:`/* hyperbolic_module.template.h, apply_boundary_conditions() with
+ * HyperbolicSystemView::apply_boundary_conditions() for the boundary ids of
+ * ryujin's "cylinder" geometry:
+ *   x = x0, x0 + Lx:      Dirichlet, the background state B0 (the
+ *                         stratified atmosphere and the wind). Both lie
+ *                         inside sponge layers that relax toward B0; ryujin's
+ *                         dynamic condition (which rebuilds the state from
+ *                         Riemann invariants) is not balanced for the wind
+ *                         by the calibration at rest and makes spurious
+ *                         vertical wind there.
+ *   y = y0, y0 + Ly:      slip, normal (0, -/+1), or optionally ryujin's
+ *                         dynamic condition with B0 as data
+ *   body:                 slip, with the normal of the exact shape (shape.wgsl).
+ *   painted obstacles:    slip, with ryujin's discrete boundary normal.
+ *                         For a moving body the normal momentum relative to
+ *                         the surface velocity is removed (NOT in ryujin); E
+ *                         is kept, as in ryujin's slip condition, unless |m| grows. */
+@group(0) @binding(1) var<uniform> ST: Stage;
+@group(0) @binding(2) var<storage, read_write> S: array<vec4f>;
+@group(0) @binding(5) var<storage, read> B0: array<vec4f>;
+
+/* HyperbolicSystemView::prescribe_riemann_characteristic<component>(U, U_bar, normal)
+ * (euler/hyperbolic_system.h): component 1 takes R_1 from U_bar, component 2
+ * takes R_2 from U_bar; entropy and tangential velocity come from U. */
+fn prescribeRiemannCharacteristic(component: u32, U: vec4f, Ub: vec4f, n: vec2f) -> vec4f {
+  let g = P.gamma;
+  let rho = U.x; let a = speedOfSound(U); let vn = dot(U.yz, n) / rho;
+  let rhoB = Ub.x; let aB = speedOfSound(Ub); let vnB = dot(Ub.yz, n) / rhoB;
+  let R1 = select(vn - 2.0 * a / (g - 1.0), vnB - 2.0 * aB / (g - 1.0), component == 1u);
+  let R2 = select(vn + 2.0 * a / (g - 1.0), vnB + 2.0 * aB / (g - 1.0), component == 2u);
+  let p = pressure(U);
+  let sE = p / pow(rho, g);
+  let vperp = U.yz / rho - vn * n;
+  let vnNew = 0.5 * (R1 + R2);
+  let q = (g - 1.0) / 4.0 * (R2 - R1);
+  var rhoNew = 1.0 / (g * sE) * q * q;
+  rhoNew = pow(rhoNew, 1.0 / (g - 1.0));
+  let pNew = sE * pow(rhoNew, g);
+  let v = vnNew * n + vperp;
+  return vec4f(rhoNew, rhoNew * v, pNew / (g - 1.0) + 0.5 * rhoNew * (vnNew * vnNew + dot(vperp, vperp)));
+}
+/* apply_boundary_conditions(), Boundary::dynamic, with Dirichlet data Ub */
+fn dynamicBC(U: vec4f, n: vec2f, Ub: vec4f) -> vec4f {
+  let a = speedOfSound(U);
+  let vn = dot(U.yz, n) / U.x;
+  var r = U;
+  if (vn < -a) { r = Ub; }                                                      /* supersonic inflow */
+  if (vn >= -a && vn <= 0.0) { r = prescribeRiemannCharacteristic(2u, Ub, U, n); } /* subsonic inflow */
+  if (vn > 0.0 && vn <= a) { r = prescribeRiemannCharacteristic(1u, U, Ub, n); }  /* subsonic outflow */
+  return r;                                                                            /* supersonic outflow: keep */
+}
+
+@compute @workgroup_size(WG, WG)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= P.nx || gid.y >= P.ny) { return; }
+  let ix = i32(gid.x); let iy = i32(gid.y);
+  if (!isActive(ix, iy) || !onB(ix, iy)) { return; }
+  let k = ST.inSlot * NN() + gid.y * P.nx + gid.x;
+  var U = S[k];
+  let Ub = B0[gid.y * P.nx + gid.x];
+  let nxm = i32(P.nx) - 1; let nym = i32(P.ny) - 1;
+  if (P.bcMode == 2u && (ix == 0 || ix == nxm)) {
+    /* closed box: slip walls left and right too */
+    let n = vec2f(select(-1.0, 1.0, ix == nxm), 0.0);
+    U = vec4f(U.x, U.yz - dot(U.yz, n) * n, U.w);
+  } else if (ix == 0 || ix == nxm) {
+    /* left and right: Dirichlet */
+    U = Ub;
+  }
+  if (iy == 0 || iy == nym) {
+    let n = vec2f(0.0, select(-1.0, 1.0, iy == nym));
+    if (P.openTB > 0.5) { U = dynamicBC(U, n, Ub); }
+    else { U = vec4f(U.x, U.yz - dot(U.yz, n) * n, U.w); }
+  }
+  if (ix > 0 && ix < nxm && iy > 0 && iy < nym) {
+    /* interior boundary: next to the body (shape normal, surface velocity)
+     * or to a painted obstacle (at rest; ryujin's discrete boundary normal
+     * nu_i = sum_j c_ji, which on the staircase is axis aligned or diagonal) */
+    let x = vec2f(P.x0 + f32(ix) * P.dx, P.y0 + f32(iy) * P.dy);
+    var n: vec2f;
+    var vw = vec2f(0.0);
+    if (bodyAdj(ix, iy)) {
+      /* Shape normal, evaluated one cell into the gas (along -nu_i) rather
+       * than at the node: an edge node can lie inside the shape (the mask
+       * keeps cells that are less than half covered), where the gradient of
+       * the distance points to the nearest face and can disagree with the
+       * node's actual boundary (e.g. by 45 degrees at a square's corner),
+       * which lets mass and energy through the wall. */
+      let nu = boundaryNormal(ix, iy);
+      let l = length(nu);
+      let off = select(vec2f(0.0), -nu / l * max(P.dx, P.dy), l > 0.0);
+      n = bodyNormal(x + off);
+      vw = bodySurfaceVel(x);
+    } else {
+      let nu = boundaryNormal(ix, iy);
+      let l = length(nu);
+      n = select(vec2f(0.0), nu / l, l > 0.0);
+    }
+    let mRel = U.yz - U.x * vw;
+    let m = U.yz - dot(mRel, n) * n;
+    /* A moving body can increase |m|; add that kinetic energy so the
+     * internal energy is unchanged. For a wall at rest |m| never grows and
+     * this is exactly ryujin's slip condition (E kept). */
+    let dke = 0.5 * (dot(m, m) - dot(U.yz, U.yz)) / U.x;
+    U = vec4f(U.x, m, U.w + max(dke, 0.0));
+  }
+  S[k] = U;
+}
+`,PREC:`/* HyperbolicSystem::fill_precomputed_values() (euler/hyperbolic_system.h):
+ * PV[i] = (specific entropy s_i, Harten entropy eta_i) of the stage state. */
+@group(0) @binding(1) var<uniform> ST: Stage;
+@group(0) @binding(2) var<storage, read> S: array<vec4f>;
+@group(0) @binding(9) var<storage, read_write> PVW: array<vec2f>;
+@compute @workgroup_size(WG, WG)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= P.nx || gid.y >= P.ny) { return; }
+  let i = gid.y * P.nx + gid.x;
+  if (!isActive(i32(gid.x), i32(gid.y))) { return; }
+  let U = S[ST.inSlot * NN() + i];
+  PVW[i] = vec2f(specificEntropy(U), hartenEntropy(U));
+}
+`,DIJ:`/* hyperbolic_module.template.h, Step 2: off-diagonal d_ij for the upper
+ * triangle only (j > i in the global numbering, i.e. neighbors k = 4..7),
+ * with max(d_ij, d_ji) for pairs of boundary dofs, and alpha_i from the
+ * IndicatorView (euler/indicator.h). Step 3 (symmetrization, d_ii, tau_max)
+ * is dsum.wgsl. D[i * 10 + k] = d_ij for neighbor k, D[i * 10 + 8] = alpha_i,
+ * D[i * 10 + 9] = d_ii. */
+@group(0) @binding(1) var<uniform> ST: Stage;
+@group(0) @binding(2) var<storage, read> S: array<vec4f>;
+@group(0) @binding(3) var<storage, read_write> D: array<f32>;
+@group(0) @binding(9) var<storage, read> PV: array<vec2f>;  /* (s, eta) precomputed */
+
+fn dPair(ix: i32, iy: i32, jx: i32, jy: i32, Ui: vec4f, Uj: vec4f) -> f32 {
+  let o = vec2i(jx - ix, jy - iy);
+  let cij = cvec(ix, iy, o.x, o.y);
+  let cji = cvec(jx, jy, -o.x, -o.y);
+  let nij = length(cij); let nji = length(cji);
+  if (onB(ix, iy) && onB(jx, jy)) {
+    return max(nij * lambdaMax(Ui, Uj, cij / nij), nji * lambdaMax(Uj, Ui, cji / nji));
+  }
+  return nij * lambdaMax(Ui, Uj, cij / nij);
+}
+
+@compute @workgroup_size(WG, WG)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x < P.nx && gid.y < P.ny && isActive(i32(gid.x), i32(gid.y))) {
+    let ix = i32(gid.x); let iy = i32(gid.y);
+    let i = gid.y * P.nx + gid.x;
+    let base = ST.inSlot * NN();
+    let Ui = S[base + i];
+
+    /* IndicatorView::reset() (eta_i is the precomputed Harten entropy) */
+    let rhoIInv = 1.0 / Ui.x;
+    let etaI = PV[i].y;
+    var dEtaI = hartenEntropyDerivative(Ui);
+    dEtaI.x -= etaI * rhoIInv;
+    var left = 0.0;
+    var right = vec4f(0.0);
+    /* accumulate() for j = i (col_idx 0) adds exactly zero for Euler. */
+
+    for (var k = 0u; k < 8u; k++) {
+      let o = offk(k);
+      if (!coupled(ix, iy, o)) { continue; }
+      let jx = ix + o.x; let jy = iy + o.y;
+      let j = u32(jy) * P.nx + u32(jx);
+      let Uj = S[base + j];
+      let c = cvec(ix, iy, o.x, o.y);
+      /* IndicatorView::accumulate() */
+      let etaJ = PV[j].y;
+      left += (etaJ / Uj.x - etaI * rhoIInv) * dot(Uj.yz, c);
+      right += fC(Uj, c) - fC(Ui, c);
+      /* upper triangle only; dsum.wgsl copies d_ji into the lower entries */
+      if (k >= 4u) { D[i * 10u + k] = dPair(ix, iy, jx, jy, Ui, Uj); }
+    }
+
+    /* IndicatorView::alpha(hd_i) */
+    let mi = mlump(ix, iy);
+    let hd = mi * P.omegaInv;
+    var num = left;
+    var den = abs(left);
+    for (var c = 0u; c < 4u; c++) {
+      num -= dEtaI[c] * right[c];
+      den += abs(dEtaI[c] * right[c]);
+    }
+    let q = abs(num) / (den + hd * abs(etaI));
+    D[i * 10u + 8u] = min(1.0, P.evc * q);
+  }
+}
+`,DSUM:`/* hyperbolic_module.template.h, Step 3: fill the lower triangle of d_ij from
+ * the upper one (d_ij = d_ji), d_ii = -sum_j d_ij, and the reduction
+ * tau_max = min_i cfl * m_i / (-2 d_ii). */
+@group(0) @binding(3) var<storage, read_write> D: array<f32>;
+@group(0) @binding(4) var<storage, read_write> info: Info;
+var<workgroup> wmin: atomic<u32>;
+@compute @workgroup_size(WG, WG)
+fn main(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_index) li: u32) {
+  if (li == 0u) { atomicStore(&wmin, 0x7f800000u); }
+  workgroupBarrier();
+  if (gid.x < P.nx && gid.y < P.ny && isActive(i32(gid.x), i32(gid.y))) {
+    let ix = i32(gid.x); let iy = i32(gid.y);
+    let i = gid.y * P.nx + gid.x;
+    var dsum = 0.0;
+    for (var k = 0u; k < 8u; k++) {
+      let o = offk(k);
+      if (!coupled(ix, iy, o)) { continue; }
+      var d: f32;
+      if (k < 4u) {
+        d = D[nodeIdx(ix + o.x, iy + o.y) * 10u + (7u - k)];
+        D[i * 10u + k] = d;
+      } else {
+        d = D[i * 10u + k];
+      }
+      dsum -= d;
+    }
+    let dii = min(dsum, -1.0e6 * FMIN);
+    D[i * 10u + 9u] = dii;
+    atomicMin(&wmin, bitcast<u32>(P.cfl * mlump(ix, iy) / (-2.0 * dii)));
+  }
+  workgroupBarrier();
+  if (li == 0u) { atomicMin(&info.tauMin, atomicLoad(&wmin)); }
+}
+`,TAU:`/* ERK(3,3,1): tau is fixed by the CFL condition at the first stage; later
+ * stages only check it against their own bound (stViol). With a fixed tau
+ * (P.grav.y > 0, needed by the well-balancing correction, see source.wgsl)
+ * every stage checks it against the bound at CFL number 1. */
+@group(0) @binding(1) var<uniform> ST: Stage;
+@group(0) @binding(2) var<storage, read_write> info: Info;
+@compute @workgroup_size(1)
+fn main() {
+  let tmax = bitcast<f32>(atomicLoad(&info.tauMin));
+  if (P.grav.y > 0.0) {
+    info.tau = P.grav.y;
+    if (P.grav.y > tmax / P.cfl) { info.stViol = info.stViol + 1u; }
+  } else if (ST.s == 0u) {
+    info.tau = tmax;
+  } else if (info.tau > 2.0 * tmax) {
+    info.stViol = info.stViol + 1u;
+  }
+  atomicStore(&info.tauMin, 0x7f800000u);
+  if (ST.s == 2u) {
+    info.time = info.time + 3.0 * info.tau;
+    info.steps = info.steps + 1u;
+  }
+}
+`,LOW:`/* hyperbolic_module.template.h, Step 4: low-order update, limiter bounds,
+ * F_iH (r_i), and the first part of P_ij. The Euler equations have no
+ * source terms, no high-order flux, and no affine shift. */
+@group(0) @binding(1) var<uniform> ST: Stage;
+@group(0) @binding(2) var<storage, read_write> S: array<vec4f>;
+@group(0) @binding(3) var<storage, read> D: array<f32>;
+@group(0) @binding(4) var<storage, read_write> RB: array<vec4f>;
+@group(0) @binding(5) var<storage, read_write> PM: array<vec4f>;
+@group(0) @binding(6) var<storage, read> info: InfoR;
+@group(0) @binding(9) var<storage, read> PV: array<vec2f>;  /* (s, eta) precomputed */
+
+@compute @workgroup_size(WG, WG)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= P.nx || gid.y >= P.ny) { return; }
+  let ix = i32(gid.x); let iy = i32(gid.y);
+  if (!isActive(ix, iy)) { return; }
+  let i = gid.y * P.nx + gid.x;
+  let nn = NN();
+  let tau = info.tau;
+  let bIn = ST.inSlot * nn;
+  let bA = ST.slotA * nn;
+  let bB = ST.slotB * nn;
+
+  /* weight = 1 - sum of stage weights */
+  var wsum = 0.0;
+  if (ST.nst >= 1u) { wsum += ST.wA; }
+  if (ST.nst >= 2u) { wsum += ST.wB; }
+  let weight = 1.0 - wsum;
+
+  let Ui = S[bIn + i];
+  let UiA = S[bA + i];
+  let UiB = S[bB + i];
+  let alphai = D[i * 10u + 8u];
+  let dii = D[i * 10u + 9u];
+  let mi = mlump(ix, iy);
+  let miInv = 1.0 / mi;
+
+  var Unew = Ui;
+  var F = vec4f(0.0);
+  var acc = limReset();
+
+  /* col_idx 0 is the diagonal j = i */
+  for (var kk = 0u; kk < 9u; kk++) {
+    var o = vec2i(0, 0);
+    var d = dii;
+    if (kk > 0u) {
+      o = offk(kk - 1u);
+      if (!coupled(ix, iy, o)) { continue; }
+      d = D[i * 10u + (kk - 1u)];
+    }
+    let jx = ix + o.x; let jy = iy + o.y;
+    let j = u32(jy) * P.nx + u32(jx);
+    let Uj = S[bIn + j];
+    let alphaj = D[j * 10u + 8u];
+    let dH = d * ((alphai + alphaj) * 0.5);
+    let c = cvec(ix, iy, o.x, o.y);
+    let scale = select(1.0 / d, 0.0, abs(d) < EPS * EPS);
+    let sc = c * scale;
+
+    let fij = fluxDiv(Ui, Uj, c);
+    Unew += tau * miInv * fij;
+    var Pij = -fij;
+
+    Unew += tau * miInv * d * (Uj - Ui);
+    F += dH * (Uj - Ui);
+    Pij += (dH - d) * (Uj - Ui);
+    limAccumulate(&acc, Ui, Uj, PV[j].x, sc);
+
+    /* have_high_order_flux == false: */
+    F += weight * fij;
+    Pij += weight * fij;
+
+    if (ST.nst >= 1u) {
+      let fA = fluxDiv(UiA, S[bA + j], c);
+      F += ST.wA * fA; Pij += ST.wA * fA;
+    }
+    if (ST.nst >= 2u) {
+      let fB = fluxDiv(UiB, S[bB + j], c);
+      F += ST.wB * fB; Pij += ST.wB * fB;
+    }
+    if (kk > 0u) { PM[i * 8u + (kk - 1u)] = Pij; }
+  }
+
+  S[ST.outSlot * nn + i] = Unew;
+  RB[2u * i] = F;
+  RB[2u * i + 1u] = vec4f(limBounds(acc, mi * P.omegaInv), 0.0);
+}
+`,PIJ:`/* hyperbolic_module.template.h, Step 5: second part of P_ij (Neumann
+ * series mass correction) and l_ij of the first limiter round. */
+@group(0) @binding(1) var<uniform> ST: Stage;
+@group(0) @binding(2) var<storage, read> S: array<vec4f>;
+@group(0) @binding(3) var<storage, read> RB: array<vec4f>;
+@group(0) @binding(4) var<storage, read_write> PM: array<vec4f>;
+@group(0) @binding(5) var<storage, read_write> LIJ: array<f32>;
+@group(0) @binding(6) var<storage, read_write> info: Info;
+
+@compute @workgroup_size(WG, WG)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= P.nx || gid.y >= P.ny) { return; }
+  let ix = i32(gid.x); let iy = i32(gid.y);
+  if (!isActive(ix, iy)) { return; }
+  let i = gid.y * P.nx + gid.x;
+  let tau = info.tau;
+  let miInv = 1.0 / mlump(ix, iy);
+  let bnd = RB[2u * i + 1u].xyz;
+  let Unew = S[ST.outSlot * NN() + i];
+  let FiH = RB[2u * i];
+  let factor = tau * miInv * (rowLen(ix, iy) - 1.0);
+  var bad = 0u;
+  for (var k = 0u; k < 8u; k++) {
+    let o = offk(k);
+    if (!coupled(ix, iy, o)) { continue; }
+    let jx = ix + o.x; let jy = iy + o.y;
+    let j = u32(jy) * P.nx + u32(jx);
+    var Pij = PM[i * 8u + k];
+    let FjH = RB[2u * j];
+    let mjInv = 1.0 / mlump(jx, jy);
+    let mij = mcons(ix, iy, o.x, o.y);
+    let bij = 0.0 - mij * mjInv;
+    let bji = 0.0 - mij * miInv;
+    Pij += bij * FjH - bji * FiH;
+    Pij *= factor;
+    PM[i * 8u + k] = Pij;
+    let r = limit(bnd, Unew, Pij);
+    LIJ[i * 8u + k] = r.x;
+    if (r.y == 0.0) { bad = 1u; }
+  }
+  if (bad != 0u) { atomicAdd(&info.loViol, 1u); }
+}
+`,LIM1:`/* Steps 6, 7 (first pass): symmetrize l_ij, high-order update, and
+ * compute the next l_ij, stored as (1 - l_ij^(1)) * l_ij^(2). */
+@group(0) @binding(1) var<uniform> ST: Stage;
+@group(0) @binding(2) var<storage, read_write> S: array<vec4f>;
+@group(0) @binding(3) var<storage, read> RB: array<vec4f>;
+@group(0) @binding(4) var<storage, read> PM: array<vec4f>;
+@group(0) @binding(5) var<storage, read> LIJ: array<f32>;
+@group(0) @binding(6) var<storage, read_write> LN: array<f32>;
+@group(0) @binding(7) var<storage, read_write> info: Info;
+
+@compute @workgroup_size(WG, WG)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= P.nx || gid.y >= P.ny) { return; }
+  let ix = i32(gid.x); let iy = i32(gid.y);
+  if (!isActive(ix, iy)) { return; }
+  let i = gid.y * P.nx + gid.x;
+  let k0 = ST.outSlot * NN() + i;
+  var U = S[k0];
+  let lam = 1.0 / (rowLen(ix, iy) - 1.0);
+  for (var k = 0u; k < 8u; k++) {
+    let o = offk(k);
+    if (!coupled(ix, iy, o)) { continue; }
+    let j = u32(iy + o.y) * P.nx + u32(ix + o.x);
+    let l = min(LIJ[i * 8u + k], LIJ[j * 8u + (7u - k)]);
+    U += l * lam * PM[i * 8u + k];
+  }
+  if (!isAdmissible(U)) { atomicAdd(&info.admViol, 1u); }
+  S[k0] = U;
+  let bnd = RB[2u * i + 1u].xyz;
+  var bad = 0u;
+  for (var k = 0u; k < 8u; k++) {
+    let o = offk(k);
+    if (!coupled(ix, iy, o)) { continue; }
+    let j = u32(iy + o.y) * P.nx + u32(ix + o.x);
+    let oldl = min(LIJ[i * 8u + k], LIJ[j * 8u + (7u - k)]);
+    let newP = (1.0 - oldl) * PM[i * 8u + k];
+    let r = limit(bnd, U, newP);
+    if (r.y == 0.0) { bad = 1u; }
+    LN[i * 8u + k] = (1.0 - oldl) * r.x;
+  }
+  if (bad != 0u) { atomicAdd(&info.loViol, 1u); }
+}
+`,LIM2:`/* Steps 6, 7 (last pass): symmetrize l_ij and high-order update. */
+@group(0) @binding(1) var<uniform> ST: Stage;
+@group(0) @binding(2) var<storage, read_write> S: array<vec4f>;
+@group(0) @binding(3) var<storage, read> PM: array<vec4f>;
+@group(0) @binding(4) var<storage, read> LN: array<f32>;
+@group(0) @binding(5) var<storage, read_write> info: Info;
+
+@compute @workgroup_size(WG, WG)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= P.nx || gid.y >= P.ny) { return; }
+  let ix = i32(gid.x); let iy = i32(gid.y);
+  if (!isActive(ix, iy)) { return; }
+  let i = gid.y * P.nx + gid.x;
+  let k0 = ST.outSlot * NN() + i;
+  var U = S[k0];
+  let lam = 1.0 / (rowLen(ix, iy) - 1.0);
+  for (var k = 0u; k < 8u; k++) {
+    let o = offk(k);
+    if (!coupled(ix, iy, o)) { continue; }
+    let j = u32(iy + o.y) * P.nx + u32(ix + o.x);
+    let l = min(LN[i * 8u + k], LN[j * 8u + (7u - k)]);
+    U += l * lam * PM[i * 8u + k];
+  }
+  if (!isAdmissible(U)) { atomicAdd(&info.admViol, 1u); }
+  S[k0] = U;
+}
+`,FINISH:`/* End of an ERK(3,3,1) step: the last stage result (slot 3) becomes U^{n+1} (slot 0). */
+@group(0) @binding(1) var<storage, read_write> S: array<vec4f>;
+@compute @workgroup_size(WG, WG)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= P.nx || gid.y >= P.ny) { return; }
+  let i = gid.y * P.nx + gid.x;
+  S[i] = S[3u * NN() + i];
+}
+`,SOURCE:`/* Source half step of the Strang splitting (NOT in ryujin; one step is
+ * source(h), ERK(3,3,1) over 3 tau, source(h) with h = 3 tau / 2):
+ *   Rayleigh damping toward the background U0 = B0 in the sponge layers,
+ *     U <- U0 + exp(-sigma h) (U - U0),
+ *   then gravity S(U) = (0, 0, -rho g, -g m_y), integrated exactly: rho is
+ *   constant, so m_y(t) = m_y - rho g t and E(t) = E - g (m_y t - rho g t^2 / 2),
+ *   which leaves the internal energy (and the specific entropy) unchanged.
+ * Well-balancing: the second half step (SUBTRACT) also removes DL, the change
+ * of B0 over one full step without this correction (Solver.calibrate), so
+ * that B0 is a fixed point of the discrete step to round-off. */
+override SUBTRACT: bool = false;
+@group(0) @binding(1) var<storage, read_write> S: array<vec4f>;
+@group(0) @binding(2) var<storage, read> B0: array<vec4f>;
+@group(0) @binding(3) var<storage, read> DL: array<vec4f>;
+@group(0) @binding(4) var<storage, read_write> info: Info;
+
+fn ramp(t: f32) -> f32 { let c = clamp(t, 0.0, 1.0); return c * c; }
+
+@compute @workgroup_size(WG, WG)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= P.nx || gid.y >= P.ny) { return; }
+  let ix = i32(gid.x); let iy = i32(gid.y);
+  if (!isActive(ix, iy)) { return; }
+  let i = gid.y * P.nx + gid.x;
+  let h = 1.5 * P.grav.y;
+  let U0 = B0[i];
+  var U = S[i];
+
+  /* sponge: sigma ramps up quadratically across each layer */
+  let x = P.x0 + f32(ix) * P.dx; let y = P.y0 + f32(iy) * P.dy;
+  let xr = P.x0 + f32(P.nx - 1u) * P.dx; let yt = P.y0 + f32(P.ny - 1u) * P.dy;
+  let sp = P.sponge;
+  let w = max(ramp((y - sp.x) / max(yt - sp.x, 1e-6)),
+          max(ramp((sp.y - x) / max(sp.y - P.x0, 1e-6)), ramp((x - sp.z) / max(xr - sp.z, 1e-6))));
+  if (w > 0.0) { U = U0 + exp(-sp.w * w * h) * (U - U0); }
+
+  let g = P.grav.x;
+  let my = U.z;
+  U.z = my - U.x * g * h;
+  U.w = U.w - g * (my * h - 0.5 * U.x * g * h * h);
+
+  if (SUBTRACT) {
+    U -= DL[i];
+    if (!isAdmissible(U)) { atomicAdd(&info.admViol, 1u); }
+  }
+  S[i] = U;
+}
+`,DRIFT:`/* Calibration (Solver.calibrate; see source.wgsl), on the active nodes, with
+ * B0 holding the state the step was applied to:
+ *   MODE 0: DL = (S - B0) + DW, the drift to subtract from every step;
+ *   MODE 1: DW = DW - (S - B0), used to build the wind correction DW. */
+override MODE: u32 = 0u;
+@group(0) @binding(1) var<storage, read> S: array<vec4f>;
+@group(0) @binding(2) var<storage, read> B0: array<vec4f>;
+@group(0) @binding(3) var<storage, read_write> DL: array<vec4f>;
+@group(0) @binding(4) var<storage, read_write> DW: array<vec4f>;
+@compute @workgroup_size(WG, WG)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= P.nx || gid.y >= P.ny) { return; }
+  let i = gid.y * P.nx + gid.x;
+  let d = select(vec4f(0.0), S[i] - B0[i], isActive(i32(gid.x), i32(gid.y)));
+  if (MODE == 0u) { DL[i] = d + DW[i]; } else { DW[i] = DW[i] - d; }
+}
+`},c=e,l=t,u=n;function d(){return`const EPS: f32 = 1.1920929e-7;
+const WG: u32 = 16u;
+`}function ee(c){return c===`MASK`?d()+e+n+r:c===`CLEAN`?d()+e+i:c===`GEOM`?d()+e+n+a+o:d()+e+n+t+s[c]}var f=[`cylinder`,`square`,`wedge`,`doublewedge`,`naca`];function p(e){let t=e.padStart(4,`0`).split(``).map(Number);return[.01*t[0],.1*t[1],.1*t[2]+.01*t[3]]}function te(e){return{cylinder:1,square:.9*Math.SQRT2,wedge:1.2,doublewedge:1.6,naca:1.62}[e]}function ne(e,t,n){let r=Math.abs(e)-n,i=Math.abs(t)-n;return Math.hypot(Math.max(r,0),Math.max(i,0))+Math.min(Math.max(r,i),0)}function re(e,t,n){let r=(n,r)=>(r[0]-n[0])*(t-n[1])-(r[1]-n[1])*(e-n[0]),i=r(n[0],n[1]),a=r(n[1],n[2]),o=r(n[2],n[0]);return i>=0&&a>=0&&o>=0||i<=0&&a<=0&&o<=0}function ie(e,t,[n,r,i]){if(e<=0||e>=1)return!1;let a=e,o=5*i*(.2969*Math.sqrt(a)+a*(-.126+a*(-.3516+a*(.2843+a*-.1036)))),s=0;return n>0&&(s=a<r?n/(r*r)*(2*r*a-a*a):n/((1-r)*(1-r))*(1-2*r+2*r*a-a*a)),Math.abs(t-s)<o}function ae(e,t,n,r,i){let a=0;for(let o=0;o<16;o++)oe(e,t+((o&3)-1.5)/4*r,n+((o>>2)-1.5)/4*i)&&a++;return a>=8}function oe(e,t,n){let r=-e.aoa,i=Math.cos(r),a=Math.sin(r),o=t-e.cx,s=n-e.cy,c=(i*o+a*s)/e.r,l=(-a*o+i*s)/e.r;switch(e.shape){case`square`:return ne(c,l,.9)<0;case`wedge`:{let e=Math.tan(15*Math.PI/180);return re(c,l,[[-1.2,0],[.8,-2*e],[.8,2*e]])}case`doublewedge`:return Math.abs(c)/1.6+Math.abs(l)/.192<1;case`naca`:return ie(c/3.2+.5,l/3.2,p(e.naca));default:return Math.hypot(c,l)<1}}var m=192,h={nx:193,ny:65,x0:0,y0:0,Lx:12,Ly:4,gamma:1.4,refRho:1,relaxSmall:100,relaxLarge:1e4,cfl:.9,evc:1,relaxFactor:1,newtonTol:1e-4,newtonMaxIter:2,g:.5,wind:.15,sponge:[2.8,1,10.5,1],tauSafety:.8,body:{cx:0,cy:0,r:.25,enabled:!1,shape:`cylinder`,aoa:0,naca:`0012`},bcMode:0,openTB:!1};function g(e){let t=new Uint32Array(e),n=new Float32Array(e);return{tau:n[1],time:n[2],steps:t[3],loViol:t[4],stViol:t[5],admViol:t[6]}}function _(e,[t,n,r,i]){return[t,t*n,t*r,i/(e-1)+.5*t*(n*n+r*r)]}function v(e,t){let n=Math.exp(-e.gamma*e.g*(t-e.y0));return[n,e.wind,0,n/e.gamma]}var se=class{device;cfg;NN;dx;dy;p;b;bodyVel=[0,0,0];tauFix=0;infoBusy=!1;g;gFinish;gMask;gGeom;gClean;gDsum;gSrc1;gSrc2;gDrift;gDriftW;obstacles;obstacleCount=0;obstaclesDirty=!1;gFill;gCommit;constructor(e,t={}){this.device=e,this.cfg={...h,...t,body:{...h.body,...t.body??{}}};let n=this.cfg,r=GPUBufferUsage,i=n.nx*n.ny;this.NN=i,this.dx=n.Lx/(n.nx-1),this.dy=n.Ly/(n.ny-1);let a=(t,n)=>e.createComputePipeline({layout:`auto`,compute:{module:e.createShaderModule({code:ee(t)}),entryPoint:`main`,constants:n}});this.p={mask:a(`MASK`),clean:a(`CLEAN`),geom:a(`GEOM`),fill:a(`FILL`),commit:a(`COMMIT`),bc:a(`BC`),prec:a(`PREC`),dij:a(`DIJ`),dsum:a(`DSUM`),tau:a(`TAU`),low:a(`LOW`),pij:a(`PIJ`),lim1:a(`LIM1`),lim2:a(`LIM2`),finish:a(`FINISH`),src1:a(`SOURCE`,{SUBTRACT:0}),src2:a(`SOURCE`,{SUBTRACT:1}),drift:a(`DRIFT`,{MODE:0}),driftW:a(`DRIFT`,{MODE:1})};let o=r.STORAGE|r.COPY_SRC|r.COPY_DST,s=(n.nx-1)*(n.ny-1);this.b={params:e.createBuffer({size:m,usage:r.UNIFORM|r.COPY_DST}),stage:[0,1,2].map(()=>e.createBuffer({size:32,usage:r.UNIFORM|r.COPY_DST})),S:e.createBuffer({size:4*i*16,usage:o}),D:e.createBuffer({size:i*10*4,usage:o}),RB:e.createBuffer({size:i*2*16,usage:o}),PM:e.createBuffer({size:i*8*16,usage:o}),LIJ:e.createBuffer({size:i*8*4,usage:o}),LN:e.createBuffer({size:i*8*4,usage:o}),info:e.createBuffer({size:32,usage:o}),infoRead:e.createBuffer({size:32,usage:r.MAP_READ|r.COPY_DST}),infoSave:e.createBuffer({size:32,usage:o}),M:e.createBuffer({size:s*4,usage:o}),A:e.createBuffer({size:i*4,usage:o}),O:e.createBuffer({size:s*4,usage:o}),MR:e.createBuffer({size:s*4,usage:o}),NF:e.createBuffer({size:i*4,usage:o}),CM:e.createBuffer({size:i*9*16,usage:o}),PV:e.createBuffer({size:i*8,usage:o}),B0:e.createBuffer({size:i*16,usage:o}),BR:e.createBuffer({size:i*16,usage:o}),B0Save:e.createBuffer({size:i*16,usage:o}),DL:e.createBuffer({size:i*16,usage:o}),DW:e.createBuffer({size:i*16,usage:o}),SAVE:e.createBuffer({size:i*16,usage:o})},this.obstacles=new Uint8Array(s),[{s:0,inSlot:0,outSlot:1,nst:0,slotA:0,slotB:0,wA:0,wB:0},{s:1,inSlot:1,outSlot:2,nst:1,slotA:0,slotB:0,wA:-1,wB:0},{s:2,inSlot:2,outSlot:3,nst:2,slotA:0,slotB:1,wA:.75,wB:-2}].forEach((t,n)=>{let r=new ArrayBuffer(32),i=new Uint32Array(r),a=new Float32Array(r);i[0]=t.s,i[1]=t.inSlot,i[2]=t.outSlot,i[3]=t.nst,i[4]=t.slotA,i[5]=t.slotB,a[6]=t.wA,a[7]=t.wB,e.queue.writeBuffer(this.b.stage[n],0,r)});let c=(t,n)=>e.createBindGroup({layout:t.getBindGroupLayout(0),entries:n.map(([e,t])=>({binding:e,resource:{buffer:t}}))}),l=this.b,u=[[14,l.NF],[15,l.CM]];this.g=[0,1,2].map(e=>({bc:c(this.p.bc,[[0,l.params],[1,l.stage[e]],[2,l.S],[5,l.B0],...u]),prec:c(this.p.prec,[[0,l.params],[1,l.stage[e]],[2,l.S],[9,l.PV],[14,l.NF]]),dij:c(this.p.dij,[[0,l.params],[1,l.stage[e]],[2,l.S],[3,l.D],[9,l.PV],...u]),tau:c(this.p.tau,[[0,l.params],[1,l.stage[e]],[2,l.info]]),low:c(this.p.low,[[0,l.params],[1,l.stage[e]],[2,l.S],[3,l.D],[4,l.RB],[5,l.PM],[6,l.info],[9,l.PV],...u]),pij:c(this.p.pij,[[0,l.params],[1,l.stage[e]],[2,l.S],[3,l.RB],[4,l.PM],[5,l.LIJ],[6,l.info],...u]),lim1:c(this.p.lim1,[[0,l.params],[1,l.stage[e]],[2,l.S],[3,l.RB],[4,l.PM],[5,l.LIJ],[6,l.LN],[7,l.info],[14,l.NF]]),lim2:c(this.p.lim2,[[0,l.params],[1,l.stage[e]],[2,l.S],[3,l.PM],[4,l.LN],[5,l.info],[14,l.NF]])})),this.gDsum=c(this.p.dsum,[[0,l.params],[3,l.D],[4,l.info],...u]),this.gFinish=c(this.p.finish,[[0,l.params],[1,l.S]]);let d={binding:1,resource:{buffer:l.S,offset:0,size:i*16}},f=(t,n)=>e.createBindGroup({layout:t.getBindGroupLayout(0),entries:[d,...n.map(([e,t])=>({binding:e,resource:{buffer:t}}))]});this.gSrc1=f(this.p.src1,[[0,l.params],[2,l.B0],[3,l.DL],[4,l.info],[14,l.NF]]),this.gSrc2=f(this.p.src2,[[0,l.params],[2,l.B0],[3,l.DL],[4,l.info],[14,l.NF]]),this.gDrift=f(this.p.drift,[[0,l.params],[2,l.B0],[3,l.DL],[4,l.DW],[14,l.NF]]),this.gDriftW=f(this.p.driftW,[[0,l.params],[2,l.B0],[3,l.DL],[4,l.DW],[14,l.NF]]),this.gMask=c(this.p.mask,[[0,l.params],[1,l.MR],[2,l.O]]),this.gClean=c(this.p.clean,[[0,l.params],[1,l.M],[2,l.MR]]),this.gGeom=c(this.p.geom,[[0,l.params],[1,l.M],[2,l.NF],[3,l.CM]]),this.gFill=c(this.p.fill,[[0,l.params],[1,l.S],[2,l.A],[3,l.B0],[14,l.NF]]),this.gCommit=c(this.p.commit,[[0,l.params],[1,l.A],[14,l.NF]]),this.writeBackground(),this.writeParams(),this.resetInfo()}fluidArea(){let e=this.cfg,t=e.body,n=e.nx-1,r=this.obstacleCount;if(t.enabled){let i=t.r*te(t.shape),a=Math.max(0,Math.floor((t.cx-i-e.x0)/this.dx)-1),o=Math.min(e.nx-2,Math.ceil((t.cx+i-e.x0)/this.dx)+1),s=Math.max(0,Math.floor((t.cy-i-e.y0)/this.dy)-1),c=Math.min(e.ny-2,Math.ceil((t.cy+i-e.y0)/this.dy)+1);for(let i=s;i<=c;i++)for(let s=a;s<=o;s++)!this.obstacles[i*n+s]&&ae(t,e.x0+(s+.5)*this.dx,e.y0+(i+.5)*this.dy,this.dx,this.dy)&&r++}return((e.nx-1)*(e.ny-1)-r)*this.dx*this.dy}setTerrain(e){let t=this.cfg,n=t.nx-1,r=t.ny-1,i=0;for(let a=0;a<r;a++)for(let o=0;o<n;o++){let s=+(a<r-2&&t.y0+(a+.5)*this.dy<e[o]),c=a*n+o;this.obstacles[c]!==s&&(this.obstacles[c]=s,this.obstaclesDirty=!0),i+=s}this.obstacleCount=i}writeParams(e){e&&Object.assign(this.cfg,e);let t=this.cfg,n=new ArrayBuffer(m),r=new Uint32Array(n),i=new Float32Array(n);r[0]=t.nx,r[1]=t.ny,r[2]=t.newtonMaxIter,r[3]=t.bcMode,i[4]=this.dx,i[5]=this.dy,i[6]=t.x0,i[7]=t.y0,i[8]=t.gamma,i[9]=t.refRho,i[10]=t.relaxSmall,i[11]=t.relaxLarge,i[12]=t.cfl,i[13]=t.evc,i[14]=t.relaxFactor,i[15]=t.newtonTol,i[16]=1/this.fluidArea(),i[17]=+!!t.openTB,i.set(_(t.gamma,v(t,t.y0)),20),i.set([t.body.cx,t.body.cy,t.body.r,+!!t.body.enabled],24),i.set([this.bodyVel[0],this.bodyVel[1],this.bodyVel[2],0],28),i.set([t.g,this.tauFix,0,0],32),i.set(t.sponge,36),i.set([f.indexOf(t.body.shape),-t.body.aoa,0,0],40),i.set([...p(t.body.naca),0],44),this.device.queue.writeBuffer(this.b.params,0,n)}writeBackground(){let e=this.cfg;for(let[t,n]of[[this.b.B0,e.wind],[this.b.BR,0]]){let r=new Float32Array(4*this.NN);for(let t=0;t<e.ny;t++){let i=_(e.gamma,v({...e,wind:n},e.y0+t*this.dy));for(let n=0;n<e.nx;n++)r.set(i,4*(t*e.nx+n))}this.device.queue.writeBuffer(t,0,r)}}resetInfo(){let e=new ArrayBuffer(32),t=new Uint32Array(e);t[0]=2139095040,this.device.queue.writeBuffer(this.b.info,0,e)}encodeMask(e,t){let n=this.cfg;if(this.obstaclesDirty){let e=new Uint32Array(this.obstacles.length);e.set(this.obstacles),this.device.queue.writeBuffer(this.b.O,0,e),this.obstaclesDirty=!1,this.writeParams()}e.setPipeline(this.p.mask),e.setBindGroup(0,this.gMask),e.dispatchWorkgroups(Math.ceil((n.nx-1)/16),Math.ceil((n.ny-1)/16)),e.setPipeline(this.p.clean),e.setBindGroup(0,this.gClean),e.dispatchWorkgroups(Math.ceil((n.nx-1)/16),Math.ceil((n.ny-1)/16));let r=Math.ceil(n.nx/16),i=Math.ceil(n.ny/16);e.setPipeline(this.p.geom),e.setBindGroup(0,this.gGeom),e.dispatchWorkgroups(r,i),t&&(e.setPipeline(this.p.fill),e.setBindGroup(0,this.gFill),e.dispatchWorkgroups(r,i)),e.setPipeline(this.p.commit),e.setBindGroup(0,this.gCommit),e.dispatchWorkgroups(r,i)}encodeGeometry(e){this.encodeMask(e,!0)}setState(e){this.device.queue.writeBuffer(this.b.S,0,e),this.resetInfo(),this.writeParams();let t=this.device.createCommandEncoder(),n=t.beginComputePass();this.encodeMask(n,!1),n.end(),this.device.queue.submit([t.finish()])}async reset(){let e=this.device,t=this.NN*16;this.writeBackground();let n=this.obstacles.slice(),r=()=>{let n=e.createCommandEncoder();n.copyBufferToBuffer(this.b.B0,0,this.b.S,0,t),e.queue.submit([n.finish()])};this.obstacles.fill(0),this.obstacleCount=0,this.obstaclesDirty=!0,this.tauFix=0,r(),this.setState0();let i=e.createCommandEncoder(),a=i.beginComputePass();this.encodeSteps(a,1,!1),a.end(),e.queue.submit([i.finish()]);let o=await this.readInfoNow();this.tauFix=this.cfg.tauSafety*o.tau,this.writeParams();let s=e.createCommandEncoder();s.clearBuffer(this.b.DW),e.queue.submit([s.finish()]),this.calibrate(!0);let c=e.createCommandEncoder();c.copyBufferToBuffer(this.b.DL,0,this.b.DW,0,t),e.queue.submit([c.finish()]),this.calibrate(!1,!0),this.obstacles.set(n),this.obstacleCount=n.reduce((e,t)=>e+t,0),this.obstaclesDirty=!0,r(),this.setState0(),this.calibrate()}setState0(){this.resetInfo(),this.writeParams();let e=this.device.createCommandEncoder(),t=e.beginComputePass();this.encodeMask(t,!1),t.end(),this.device.queue.submit([e.finish()])}calibrate(e=!1,t=!1){let n=this.device,r=this.NN*16,i=this.cfg,a=n.createCommandEncoder();a.copyBufferToBuffer(this.b.S,0,this.b.SAVE,0,r),a.copyBufferToBuffer(this.b.info,0,this.b.infoSave,0,32),a.copyBufferToBuffer(this.b.B0,0,this.b.B0Save,0,r),e||a.copyBufferToBuffer(this.b.BR,0,this.b.B0,0,r),a.copyBufferToBuffer(this.b.B0,0,this.b.S,0,r),a.clearBuffer(this.b.DL);let o=a.beginComputePass();this.encodeSteps(o,1),t?(o.setPipeline(this.p.driftW),o.setBindGroup(0,this.gDriftW)):(o.setPipeline(this.p.drift),o.setBindGroup(0,this.gDrift)),o.dispatchWorkgroups(Math.ceil(i.nx/16),Math.ceil(i.ny/16)),o.end(),a.copyBufferToBuffer(this.b.B0Save,0,this.b.B0,0,r),a.copyBufferToBuffer(this.b.SAVE,0,this.b.S,0,r),a.copyBufferToBuffer(this.b.infoSave,0,this.b.info,0,32),n.queue.submit([a.finish()])}async readInfoNow(){for(;;){let e=await this.readInfo();if(e)return e;await this.device.queue.onSubmittedWorkDone()}}async readInfo(){if(this.infoBusy)return null;this.infoBusy=!0;let e=this.device,t=this.b.infoRead,n=e.createCommandEncoder();n.copyBufferToBuffer(this.b.info,0,t,0,32),e.queue.submit([n.finish()]);try{await t.mapAsync(GPUMapMode.READ);let e=t.getMappedRange().slice(0);return t.unmap(),g(e)}catch{return null}finally{this.infoBusy=!1}}encodeSteps(e,t,n=!0){let r=this.cfg,i=Math.ceil(r.nx/16),a=Math.ceil(r.ny/16),o=this.p;for(let r=0;r<t;r++){n&&(e.setPipeline(o.src1),e.setBindGroup(0,this.gSrc1),e.dispatchWorkgroups(i,a));for(let t=0;t<3;t++){let n=this.g[t];e.setPipeline(o.bc),e.setBindGroup(0,n.bc),e.dispatchWorkgroups(i,a),e.setPipeline(o.prec),e.setBindGroup(0,n.prec),e.dispatchWorkgroups(i,a),e.setPipeline(o.dij),e.setBindGroup(0,n.dij),e.dispatchWorkgroups(i,a),e.setPipeline(o.dsum),e.setBindGroup(0,this.gDsum),e.dispatchWorkgroups(i,a),e.setPipeline(o.tau),e.setBindGroup(0,n.tau),e.dispatchWorkgroups(1),e.setPipeline(o.low),e.setBindGroup(0,n.low),e.dispatchWorkgroups(i,a),e.setPipeline(o.pij),e.setBindGroup(0,n.pij),e.dispatchWorkgroups(i,a),e.setPipeline(o.lim1),e.setBindGroup(0,n.lim1),e.dispatchWorkgroups(i,a),e.setPipeline(o.lim2),e.setBindGroup(0,n.lim2),e.dispatchWorkgroups(i,a)}e.setPipeline(o.finish),e.setBindGroup(0,this.gFinish),e.dispatchWorkgroups(i,a),n&&(e.setPipeline(o.src2),e.setBindGroup(0,this.gSrc2),e.dispatchWorkgroups(i,a))}}async read(){let e=this.device,t=GPUBufferUsage,n=e.createBuffer({size:this.NN*16,usage:t.MAP_READ|t.COPY_DST}),r=e.createBuffer({size:this.NN*4,usage:t.MAP_READ|t.COPY_DST}),i=e.createBuffer({size:32,usage:t.MAP_READ|t.COPY_DST}),a=e.createCommandEncoder();a.copyBufferToBuffer(this.b.S,0,n,0,this.NN*16),a.copyBufferToBuffer(this.b.A,0,r,0,this.NN*4),a.copyBufferToBuffer(this.b.info,0,i,0,32),e.queue.submit([a.finish()]),await Promise.all([n.mapAsync(GPUMapMode.READ),r.mapAsync(GPUMapMode.READ),i.mapAsync(GPUMapMode.READ)]);let o=new Float32Array(n.getMappedRange().slice(0)),s=new Uint32Array(r.getMappedRange().slice(0)),c=i.getMappedRange().slice(0);return n.unmap(),r.unmap(),i.unmap(),n.destroy(),r.destroy(),i.destroy(),{state:o,active:s,info:g(c)}}destroy(){for(let e of Object.keys(this.b))e!==`stage`&&this.b[e].destroy();for(let e of this.b.stage)e.destroy()}},ce=`/* Per-node display quantities and their global ranges (non-negative floats,
+ * so the IEEE bit patterns are monotone and atomicMin/Max on u32 works).
+ *   Q[2i] = (log theta, w, u, 0), theta the potential temperature relative
+ *           to the ground: theta = T (p / p_s)^(-(gamma - 1) / gamma) with
+ *           T = gamma p / rho and p_s = 1 / gamma (the background at y0).
+ *   Q[2i + 1] unused. */
+struct Stats { wMax: atomic<u32>, uMax: atomic<u32>, tMin: atomic<u32>, tMax: atomic<u32>, p0: u32, p1: u32, p2: u32, p3: u32 };
+@group(0) @binding(1) var<storage, read> S: array<vec4f>;
+@group(0) @binding(2) var<storage, read_write> Q: array<vec4f>;
+@group(0) @binding(3) var<storage, read_write> ST: Stats;
+@compute @workgroup_size(WG, WG)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= P.nx || gid.y >= P.ny) { return; }
+  let ix = i32(gid.x); let iy = i32(gid.y);
+  let i = gid.y * P.nx + gid.x;
+  if (!isActive(ix, iy)) { Q[2u * i] = vec4f(0.0); return; }
+  let U = S[i];
+  let rho = max(U.x, 1e-12);
+  let p = max(pressure(U), 1e-12);
+  let kappa = (P.gamma - 1.0) / P.gamma;
+  let lth = log(P.gamma * p / rho) - kappa * log(P.gamma * p);
+  let v = U.yz / rho;
+  Q[2u * i] = vec4f(lth, v.y, v.x, 0.0);
+  atomicMax(&ST.wMax, bitcast<u32>(abs(v.y)));
+  atomicMax(&ST.uMax, bitcast<u32>(abs(v.x)));
+  /* shifted by 1 to stay positive (cold air near the ground can go below 0) */
+  atomicMin(&ST.tMin, bitcast<u32>(max(lth + 1.0, 0.0)));
+  atomicMax(&ST.tMax, bitcast<u32>(max(lth + 1.0, 0.0)));
+}
+`,le=`struct Stats { wMax: u32, uMax: u32, tMin: u32, tMax: u32, p0: u32, p1: u32, p2: u32, p3: u32 };
+struct R { field: u32, lines: f32, w: f32, h: f32 };
+@group(0) @binding(2) var<storage, read> Q: array<vec4f>;
+@group(0) @binding(3) var<storage, read> SS: Stats;
+@group(0) @binding(4) var<uniform> RP: R;
+@group(0) @binding(5) var<storage, read> A: array<u32>;
+@group(0) @binding(6) var<storage, read> M: array<u32>;  /* cell mask: 1 fluid, 2 terrain */
+
+@vertex
+fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  return vec4f(p[vi], 0.0, 1.0);
+}
+fn node(i: i32, j: i32) -> u32 {
+  return u32(clamp(j, 0, i32(P.ny) - 1)) * P.nx + u32(clamp(i, 0, i32(P.nx) - 1));
+}
+/* Bilinear interpolation over the active nodes of the cell (weights renormalized). */
+fn samp(x: f32, y: f32) -> vec4f {
+  let x0 = floor(x); let y0 = floor(y);
+  let fx = x - x0; let fy = y - y0;
+  let i = i32(x0); let j = i32(y0);
+  let w = vec4f((1.0 - fx) * (1.0 - fy), fx * (1.0 - fy), (1.0 - fx) * fy, fx * fy);
+  let k = vec4u(node(i, j), node(i + 1, j), node(i, j + 1), node(i + 1, j + 1));
+  var acc = vec4f(0.0); var ws = 0.0;
+  for (var n = 0u; n < 4u; n++) {
+    if (A[k[n]] == 0u) { continue; }
+    acc += w[n] * Q[2u * k[n]]; ws += w[n];
+  }
+  return acc / max(ws, 1e-6);
+}
+/* potential temperature: deep blue (low) through teal and sand to orange (high) */
+fn thetaMap(t0: f32) -> vec3f {
+  let t = clamp(t0, 0.0, 1.0);
+  let c0 = vec3f(0.11, 0.17, 0.36); let c1 = vec3f(0.16, 0.45, 0.58);
+  let c2 = vec3f(0.55, 0.72, 0.62); let c3 = vec3f(0.93, 0.80, 0.52); let c4 = vec3f(0.89, 0.45, 0.22);
+  if (t < 0.25) { return mix(c0, c1, t / 0.25); }
+  if (t < 0.5) { return mix(c1, c2, (t - 0.25) / 0.25); }
+  if (t < 0.75) { return mix(c2, c3, (t - 0.5) / 0.25); }
+  return mix(c3, c4, (t - 0.75) / 0.25);
+}
+/* diverging: blue (negative), near white (0), red (positive) */
+fn diverging(t0: f32) -> vec3f {
+  let t = clamp(t0, -1.0, 1.0);
+  let neg = vec3f(0.17, 0.40, 0.69); let mid = vec3f(0.95, 0.95, 0.93); let pos = vec3f(0.75, 0.22, 0.17);
+  if (t < 0.0) { return mix(mid, neg, sqrt(-t)); }
+  return mix(mid, pos, sqrt(t));
+}
+
+@fragment
+fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+  let u = pos.x / RP.w; let v = 1.0 - pos.y / RP.h;
+  let gx = u * f32(P.nx - 1u); let gy = v * f32(P.ny - 1u);
+  let ci = min(u32(gx), P.nx - 2u); let cj = min(u32(gy), P.ny - 2u);
+  /* terrain: earth, darker with depth below the surface */
+  if (M[cj * (P.nx - 1u) + ci] != 1u) {
+    var top = cj;
+    for (var k = 0u; k < 64u; k++) { if (top + 1u >= P.ny - 1u || M[(top + 1u) * (P.nx - 1u) + ci] == 1u) { break; } top += 1u; }
+    let depth = (f32(top + 1u) - gy) * P.dy;
+    let rim = 1.0 - smoothstep(0.0, 0.08, depth);
+    return vec4f(mix(vec3f(0.33, 0.29, 0.24), vec3f(0.55, 0.50, 0.38), rim), 1.0);
+  }
+  let q = samp(gx, gy);
+  /* background log theta spans [0, (gamma - 1) g Ly] */
+  let thTop = max((P.gamma - 1.0) * P.grav.x * f32(P.ny - 1u) * P.dy, 1e-3);
+  var c: vec3f;
+  if (RP.field == 1u) {
+    c = diverging(q.y / max(bitcast<f32>(SS.wMax), 1e-6));
+  } else if (RP.field == 2u) {
+    c = diverging(q.z / max(bitcast<f32>(SS.uMax), 1e-6));
+  } else {
+    c = thetaMap(q.x / thTop);
+  }
+  /* isentropes: contours of log theta at RP.lines levels across the background range,
+   * drawn about one pixel wide (gradient from the neighboring pixels) */
+  if (RP.lines > 0.0 && P.grav.x > 0.0) {
+    let px = f32(P.nx - 1u) / RP.w; let py = f32(P.ny - 1u) / RP.h;
+    let s = q.x / thTop * RP.lines;
+    let gxs = (samp(gx + px, gy).x - q.x) / thTop * RP.lines;
+    let gys = (samp(gx, gy + py).x - q.x) / thTop * RP.lines;
+    let d = abs(s - round(s)) / max(length(vec2f(gxs, gys)), 1e-6);
+    let a = 1.0 - smoothstep(0.5, 1.3, d);
+    c = mix(c, select(vec3f(1.0), vec3f(0.08, 0.1, 0.12), RP.field != 0u), 0.55 * a);
+  }
+  return vec4f(c, 1.0);
+}
+`,y=[{name:`Potential temperature`,bar:`theta`},{name:`Vertical wind`,bar:`diverging`},{name:`Horizontal wind`,bar:`diverging`}];function b(e){let t=document.getElementById(e);if(!t)throw Error(`missing element #`+e);return t}var x={running:!0,field:0,N:193,ready:!1,info:{time:0,tau:0,steps:0,loViol:0,admViol:0,stViol:0},stats:[0,0,0,0],painting:!1,geometryDirty:!1,terrain:new Float32Array};function S(e){let t=b(`notice`);t.textContent=e,t.classList.add(`show`)}function C(e){b(`err`).textContent=e}function w(e,t,n){let r=b(e),i=b(`v-`+e),a=()=>{i.textContent=t(+r.value),n&&n(+r.value)};return r.addEventListener(`input`,a),a(),r}var T,E,D,O,k,A,j,M,N,P,F,I,L=!1,R={steps:0,wall:performance.now()};async function ue(){if(!navigator.gpu){S(`WebGPU isn't turned on in this browser. Safari has it on by default only on macOS 26, iOS 26 and iPadOS 26 or newer; on older macOS, turn it on in Safari → Settings → Advanced → Show features for web developers, then Develop → Feature Flags → WebGPU, and reload. Chrome or Edge work on any recent Mac, Windows or Android.`);return}let e=await navigator.gpu.requestAdapter();if(!e){S(`WebGPU is available but no GPU adapter was found. Check that hardware acceleration is turned on.`);return}T=await e.requestDevice({requiredLimits:{maxStorageBuffersPerShaderStage:Math.min(8,e.limits.maxStorageBuffersPerShaderStage)}}),T.addEventListener(`uncapturederror`,e=>C(`GPU error: `+e.error.message)),T.lost.then(e=>S(`The GPU device was lost (`+e.message+`). Reload the page to continue.`));let t=b(`view`).getContext(`webgpu`);if(!t){S(`Could not create a WebGPU canvas context.`);return}E=t,D=navigator.gpu.getPreferredCanvasFormat(),E.configure({device:T,format:D,alphaMode:`opaque`});let n=T.createShaderModule({code:c+le});k=T.createRenderPipeline({layout:`auto`,vertex:{module:n,entryPoint:`vs`},fragment:{module:n,entryPoint:`fs`,targets:[{format:D}]},primitive:{topology:`triangle-list`}}),M=T.createComputePipeline({layout:`auto`,compute:{module:T.createShaderModule({code:d()+c+u+l+ce}),entryPoint:`main`}}),j=T.createBuffer({size:16,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST}),F=T.createBuffer({size:32,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST}),I=T.createBuffer({size:32,usage:GPUBufferUsage.MAP_READ|GPUBufferUsage.COPY_DST}),b(`grid`).value=String(x.N),await z(),requestAnimationFrame(q)}async function z(){x.ready=!1,O&&(O.destroy(),P.destroy());let e=x.N;O=new se(T,{nx:e,ny:(e-1)/3+1,wind:+b(`wind`).value,g:+b(`grav`).value}),P=T.createBuffer({size:O.NN*32,usage:GPUBufferUsage.STORAGE}),N=T.createBindGroup({layout:M.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:O.b.params}},{binding:1,resource:{buffer:O.b.S,offset:0,size:O.NN*16}},{binding:2,resource:{buffer:P}},{binding:3,resource:{buffer:F}},{binding:14,resource:{buffer:O.b.NF}}]}),A=T.createBindGroup({layout:k.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:O.b.params}},{binding:2,resource:{buffer:P}},{binding:3,resource:{buffer:F}},{binding:4,resource:{buffer:j}},{binding:5,resource:{buffer:O.b.A}},{binding:6,resource:{buffer:O.b.M}}]});let t=x.terrain;if(x.terrain=new Float32Array(e-1),t.length)for(let e=0;e<x.terrain.length;e++)x.terrain[e]=t[Math.min(t.length-1,Math.floor(e*t.length/x.terrain.length))];else V();await G()}var B=(e,t,n,r)=>n/(1+(e-t)**2/(r*r));function V(){let e=b(`preset`).value,t=O.cfg,n=x.terrain;for(let r=0;r<n.length;r++){let i=t.x0+(r+.5)*O.dx;n[r]=e===`hill`?B(i,3.5,.5,.5):e===`ridge`?B(i,4,.8,1.5):e===`two`?B(i,3,.45,.45)+B(i,5.5,.45,.45):0}H()}function H(){let e=x.terrain;for(let t of[0,1,e.length-2,e.length-1])e[t]=0;O.setTerrain(e),x.geometryDirty=!0,Z()}function de(e){let t=b(`view`).getBoundingClientRect(),n=O.cfg;return{x:n.x0+(e.clientX-t.left)/t.width*n.Lx,y:n.y0+(1-(e.clientY-t.top)/t.height)*n.Ly}}var U=null;function W(e,t=!1){let n=O.cfg,r=de(e);r.y=Math.min(Math.max(r.y,n.y0),n.y0+.6*n.Ly);let i=t||!U?r:U,a=e=>(e-n.x0)/O.dx-.5,o=Math.round(Math.min(a(i.x),a(r.x))),s=Math.round(Math.max(a(i.x),a(r.x)));for(let e=Math.max(0,o);e<=Math.min(x.terrain.length-1,s);e++){let t=s>o?(e-a(i.x))/(a(r.x)-a(i.x)):1;x.terrain[e]=i.y+(r.y-i.y)*Math.min(Math.max(t,0),1)}U=r,H()}function fe(){let e=b(`view`);e.addEventListener(`pointerdown`,t=>{x.ready&&(x.painting=!0,W(t,!0),e.setPointerCapture(t.pointerId),b(`view-hint`).hidden=!0,t.preventDefault())}),e.addEventListener(`pointermove`,e=>{x.painting&&W(e)});let t=()=>{x.painting=!1,U=null};e.addEventListener(`pointerup`,t),e.addEventListener(`pointercancel`,t)}async function G(){x.ready=!1,O.writeParams({wind:+b(`wind`).value,g:+b(`grav`).value}),O.setTerrain(x.terrain),await O.reset(),x.geometryDirty=!1,x.info={time:0,tau:0,steps:0,loViol:0,admViol:0,stViol:0},R={steps:0,wall:performance.now()},Z(),x.ready=!0}function pe(){let e=b(`view`),t=Math.min(window.devicePixelRatio||1,2),n=Math.max(1,Math.round(e.clientWidth*t)),r=Math.max(1,Math.round(e.clientHeight*t));(e.width!==n||e.height!==r)&&(e.width=n,e.height=r)}var K=!1;function q(){if(requestAnimationFrame(q),!O||!x.ready||K)return;pe();let e=b(`view`),t=+b(`spf`).value;T.queue.writeBuffer(F,0,new Uint32Array([0,0,2139095040,0,0,0,0,0]));let n=new ArrayBuffer(16),r=new Uint32Array(n),i=new Float32Array(n);if(r[0]=x.field,i[1]=b(`lines`).checked?16:0,i[2]=e.width,i[3]=e.height,T.queue.writeBuffer(j,0,n),x.geometryDirty){let e=T.createCommandEncoder(),t=e.beginComputePass();O.encodeGeometry(t),t.end(),T.queue.submit([e.finish()]),O.calibrate(),x.geometryDirty=!1}let a=T.createCommandEncoder(),o=a.beginComputePass();x.running&&O.encodeSteps(o,t),o.setPipeline(M),o.setBindGroup(0,N),o.dispatchWorkgroups(Math.ceil(O.cfg.nx/16),Math.ceil(O.cfg.ny/16)),o.end();let s=!L;s&&a.copyBufferToBuffer(F,0,I,0,32);let c=a.beginRenderPass({colorAttachments:[{view:E.getCurrentTexture().createView(),loadOp:`clear`,storeOp:`store`,clearValue:{r:0,g:0,b:0,a:1}}]});c.setPipeline(k),c.setBindGroup(0,A),c.draw(3),c.end(),T.queue.submit([a.finish()]),K=!0,T.queue.onSubmittedWorkDone().then(()=>{K=!1},()=>{K=!1}),s&&me(),O.readInfo().then(e=>{e&&(x.info=e,he())})}async function me(){L=!0;try{await I.mapAsync(GPUMapMode.READ);let e=new Float32Array(I.getMappedRange().slice(0));I.unmap(),x.stats=[e[0],e[1],e[2]-1,e[3]-1],X()}catch{}finally{L=!1}}var J=()=>Math.sqrt(O.cfg.gamma-1)*O.cfg.g;function Y(e){return Math.abs(e)>=100?e.toFixed(0):Math.abs(e)>=1?e.toFixed(2):e.toFixed(3)}function X(){let[e,t]=x.stats;if(b(`leg-bar`).className=`bar `+y[x.field].bar,b(`leg-unit`).textContent=y[x.field].name,x.field===0)b(`leg-lo`).textContent=`ground`,b(`leg-hi`).textContent=`top (undisturbed)`;else{let n=x.field===1?e:t;b(`leg-lo`).textContent=Y(-n),b(`leg-hi`).textContent=Y(n)}}function Z(){let e=O.cfg.wind,t=Math.max(0,...x.terrain);b(`s-nhu`).textContent=e>0?(J()*t/e).toFixed(2):`∞`}function he(){let e=x.info,t=performance.now();if(b(`s-time`).textContent=e.time.toFixed(1),b(`s-per`).textContent=(e.time*J()/(2*Math.PI)).toFixed(1),t-R.wall>1e3){let n=(e.steps-R.steps)/((t-R.wall)/1e3);b(`s-sps`).textContent=n>0?n.toFixed(0):`–`,R={steps:e.steps,wall:t}}b(`s-w`).textContent=Y(x.stats[0]),b(`s-viol`).textContent=`${e.loViol} / ${e.admViol} / ${e.stViol}`}function Q(e){x.field=e,document.querySelectorAll(`[data-field]`).forEach(t=>t.setAttribute(`aria-pressed`,String(+t.dataset.field===e))),X()}function $(){x.running=!x.running,b(`btn-pause`).textContent=x.running?`Pause`:`Resume`}function ge(){b(`btn-pause`).addEventListener(`click`,$),b(`btn-reset`).addEventListener(`click`,()=>{x.ready&&G()}),document.querySelectorAll(`[data-field]`).forEach(e=>e.addEventListener(`click`,()=>Q(+e.dataset.field))),w(`wind`,e=>e.toFixed(2)),w(`grav`,e=>e.toFixed(2));for(let e of[`wind`,`grav`])b(e).addEventListener(`change`,()=>{x.ready&&G()});w(`spf`,e=>String(e)),b(`preset`).addEventListener(`change`,()=>{x.ready&&V()}),b(`btn-terrain`).addEventListener(`click`,()=>{x.ready&&V()}),b(`grid`).addEventListener(`change`,e=>{x.N=+e.target.value,z()});let e=b(`about`);b(`btn-about`).addEventListener(`click`,()=>e.showModal()),window.addEventListener(`keydown`,t=>{if(!(t.target instanceof HTMLInputElement||t.target instanceof HTMLSelectElement||e.open&&t.key!==`?`)){switch(t.key){case` `:$();break;case`r`:case`R`:x.ready&&G();break;case`1`:case`2`:case`3`:Q(t.key-1);break;case`l`:case`L`:{let e=b(`lines`);e.checked=!e.checked;break}case`?`:e.open?e.close():e.showModal();break;default:return}t.preventDefault()}})}ge(),fe(),ue().catch(e=>C(String(e)));</script>
+  <style rel="stylesheet" crossorigin>:root{--bg:#e7ece7;--panel:#f5f7f4;--ink:#1c2925;--muted:#56665f;--line:#c7d1ca;--accent:#245f9f;--accent-ink:#fff;--warn:#9a3b1c;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#141b19;--panel:#1c2522;--ink:#e2e9e5;--muted:#93a39c;--line:#33413b;--accent:#72a9df;--accent-ink:#0d1a26;--warn:#e59474}}:root[data-theme=dark]{--bg:#141b19;--panel:#1c2522;--ink:#e2e9e5;--muted:#93a39c;--line:#33413b;--accent:#72a9df;--accent-ink:#0d1a26;--warn:#e59474}*,:before,:after{box-sizing:inherit}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{background:var(--bg);color:var(--ink);-webkit-font-smoothing:antialiased;margin:0;font-family:Public Sans,ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;font-size:15px;line-height:1.45}.app{grid-template:"top top""tools side""stage side"minmax(0,1fr)/minmax(0,1fr) 20rem;gap:.6rem 1rem;height:100dvh;padding:.6rem 1rem .75rem;display:grid;overflow:hidden}header.top{grid-area:top;align-items:baseline;gap:.75rem;display:flex}header.top h1{letter-spacing:-.01em;margin:0;font-size:1.3rem;font-weight:700}header.top .tagline{color:var(--muted);white-space:nowrap;text-overflow:ellipsis;flex:1;min-width:0;margin:0;font-size:.9rem;overflow:hidden}button.icon{border-radius:50%;width:1.9rem;height:1.9rem;padding:0;font-weight:700}.toolbar{flex-wrap:wrap;grid-area:tools;align-items:center;gap:.4rem .6rem;display:flex}.toolbar select{width:auto;max-width:16rem;margin:0}.seg{display:inline-flex}.seg button{white-space:nowrap;border-radius:0;margin-left:-1px}.seg button:first-child{border-radius:3px 0 0 3px;margin-left:0}.seg button:last-child{border-radius:0 3px 3px 0}.seg button:focus-visible{z-index:1;position:relative}.stage-col{flex-direction:column;grid-area:stage;min-width:0;min-height:0;display:flex}.stage-wrap{flex:auto;place-items:start center;min-height:0;display:grid;container-type:size}.stage{aspect-ratio:3;border:1px solid var(--line);touch-action:none;background:#26332e;width:min(100cqw,300cqh);position:relative}.stage canvas{cursor:default;width:100%;height:100%;display:block}.stage canvas.grab{cursor:grab}.stage canvas.dragging{cursor:grabbing}.stage canvas.orbit{cursor:grab}.stage canvas.orbit:active{cursor:grabbing}.stage .notice{background:var(--panel);color:var(--ink);text-align:center;justify-content:center;align-items:center;padding:2rem;display:none;position:absolute;inset:0}.stage .notice.show{display:flex}.stage .viewhint{color:#e2e9e5;pointer-events:none;background:#141b199e;border-radius:4px;padding:.2rem .5rem;font-size:.72rem;position:absolute;top:.6rem;right:.6rem}.stats{font-variant-numeric:tabular-nums;flex-wrap:wrap;justify-content:center;gap:.15rem 1.1rem;margin-top:.45rem;font-size:.8rem;display:flex}.stats div{align-items:baseline;gap:.35rem;display:flex}.stats span{color:var(--muted)}.stats b{font-weight:600}.stats .lar b{color:var(--warn)}#err{color:var(--warn);white-space:pre-wrap;text-align:center;max-height:4.5rem;font-size:.8rem;overflow:auto}.controls{background:var(--panel);border:1px solid var(--line);flex-direction:column;grid-area:side;min-height:0;display:flex}.tabs{border-bottom:1px solid var(--line);flex:none;display:flex}.tabs button{color:var(--muted);background:0 0;border:0;border-bottom:2px solid #0000;border-radius:0;flex:1;margin-bottom:-1px;padding:.55rem .2rem;font-size:.85rem}.tabs button[aria-selected=true]{color:var(--ink);border-bottom-color:var(--accent);font-weight:600}.tabs button:hover{color:var(--ink)}.panel{flex:auto;min-height:0;padding:.4rem 1rem 1rem;overflow-y:auto}.panel>.row:first-child,.panel>label.field:first-child{margin-top:.5rem}dialog{border:1px solid var(--line);background:var(--panel);max-width:min(40rem,100vw - 2rem);max-height:calc(100dvh - 2rem);color:var(--ink);padding:1rem 1.25rem;font-size:.9rem}dialog::backdrop{background:#00000073}dialog h2{margin:0 0 .5rem;font-size:1.15rem}dialog h3{margin:1rem 0 .3rem;font-size:.95rem}dialog p{color:var(--muted);margin:.4rem 0}.keys{grid-template-columns:max-content 1fr;gap:.25rem 1rem;margin:0 0 1rem;display:grid}.keys dt{font-variant-numeric:tabular-nums;font-weight:600}.keys dd{color:var(--muted);margin:0}.row{flex-wrap:wrap;gap:.4rem;display:flex}label.field{margin-top:.5rem;font-size:.9rem;display:block}label.field.check{align-items:flex-start;gap:.5rem;display:flex}label.field.check input{accent-color:var(--accent);margin-top:.25rem}label.field .val{float:right;color:var(--muted);font-variant-numeric:tabular-nums}input[type=range]{width:100%;accent-color:var(--accent);margin:.2rem 0 0}select{width:100%;font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--line);margin-top:.2rem;padding:.35rem .4rem}button,.filebtn{font:inherit;border:1px solid var(--line);background:var(--bg);color:var(--ink);cursor:pointer;border-radius:3px;padding:.4rem .7rem;font-size:.9rem}button:hover,.filebtn:hover{border-color:var(--accent)}button.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:600}button[aria-pressed=true]{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}button:focus-visible,select:focus-visible,input:focus-visible,.filebtn:focus-within{outline:2px solid var(--accent);outline-offset:2px}.filebtn input{opacity:0;width:1px;height:1px;position:absolute}.hint{color:var(--muted);margin:.4rem 0 0;font-size:.82rem}@media (max-width:820px){.app{grid-template:"top""tools""stage""side"/minmax(0,1fr);height:auto;padding:.6rem 16px 1rem;overflow:visible}.stage-wrap{display:block;container-type:normal}.stage{width:100%}.panel{overflow:visible}.toolbar select{max-width:100%}}[hidden]{display:none!important}.stage .legend{color:#e2e9e5;pointer-events:none;background:#141b19b8;border-radius:4px;width:min(15rem,45%);padding:.35rem .5rem .3rem;font-size:.72rem;position:absolute;top:.6rem;left:.6rem}.stage .legend .bar{border-radius:2px;height:.5rem}.stage .legend .bar.theta{background:linear-gradient(90deg,#1c2b5c,#297394 25%,#8cb89e 50%,#edcc85 75%,#e37338)}.stage .legend .bar.diverging{background:linear-gradient(90deg,#2b66b0,#f2f2ed 50%,#bf382b)}.stage .legend .bar.viridis{background:linear-gradient(90deg,#440154,#3b528b,#21918c,#5ec962,#fde725)}.stage .legend .bar.inferno{background:linear-gradient(90deg,#000004,#57106e,#bc3754,#f98e09,#fcffa4)}.stage .legend .bar.heat{background:linear-gradient(90deg,#0d1a38 0%,#8c2947 40%,#ff8c1f 80%,#ffedc7 100%)}.stage .legend .bar.schlieren{background:linear-gradient(90deg,#f7faf7,#8a8c8a 40%,#000 100%)}.stage .legend .ticks{font-variant-numeric:tabular-nums;justify-content:space-between;margin-top:.1rem;display:flex}.stage .legend .unit{color:#93a39c}@media (max-width:820px){.stage .legend{width:34%;padding:.2rem .35rem;font-size:.62rem;top:.35rem;left:.35rem}.stage .legend .unit{display:none}.stage .viewhint{font-size:.62rem;top:.35rem;right:.35rem}}.toolbar .field.check.inline{align-items:center;gap:.35rem;margin:0;display:inline-flex}.stage canvas#view{cursor:crosshair}
+/*$vite$:1*/</style>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-180.png">
+</head>
+<body>
+<div class="app">
+  <header class="top">
+    <h1>Stratus</h1>
+    <p class="tagline">Wind over mountains you draw, in a stratified atmosphere, on your GPU</p>
+    <button class="icon" id="btn-about" aria-label="About and keyboard shortcuts" title="About and keyboard shortcuts (?)">?</button>
+  </header>
+
+  <div class="toolbar" role="toolbar" aria-label="Simulation">
+    <button class="primary" id="btn-pause" title="Pause or resume (Space)">Pause</button>
+    <button id="btn-reset" title="Restart from the undisturbed atmosphere (R)">Restart</button>
+    <div class="seg" role="group" aria-label="Field">
+      <button data-field="0" aria-pressed="true" title="Potential temperature (1)">θ</button>
+      <button data-field="1" aria-pressed="false" title="Vertical wind (2)">Vertical wind</button>
+      <button data-field="2" aria-pressed="false" title="Horizontal wind (3)">Horizontal wind</button>
+    </div>
+    <label class="field check inline"><input type="checkbox" id="lines" checked> <span>Isentropes</span></label>
+  </div>
+
+  <div class="stage-col">
+    <div class="stage-wrap">
+    <div class="stage" id="stage">
+      <canvas id="view" aria-label="Simulation view. Drag to draw the terrain."></canvas>
+      <div class="notice" id="notice"></div>
+      <div class="legend" id="legend" aria-hidden="true">
+        <div class="bar theta" id="leg-bar"></div>
+        <div class="ticks"><span id="leg-lo">–</span><span id="leg-hi">–</span></div>
+        <div class="unit" id="leg-unit">Potential temperature</div>
+      </div>
+      <div class="viewhint" id="view-hint">Drag to draw the terrain</div>
+    </div>
+    </div>
+    <div class="stats" aria-live="off">
+      <div><span>Time</span><b id="s-time">0.00</b></div>
+      <div title="Buoyancy periods 2π/N"><span>Periods</span><b id="s-per">0.0</b></div>
+      <div><span>Steps/s</span><b id="s-sps">–</b></div>
+      <div title="Nondimensional mountain height N h / U (highest point of the terrain)"><span>N h / U</span><b id="s-nhu">–</b></div>
+      <div title="Largest vertical wind, in units of the sound speed"><span>Max |w|</span><b id="s-w">–</b></div>
+      <div title="Limiter bound failures / non-admissible states / stages over the CFL limit"><span>Violations</span><b id="s-viol">–</b></div>
+    </div>
+    <div id="err"></div>
+  </div>
+
+  <aside class="controls">
+    <div class="panel">
+      <label class="field">Terrain
+        <select id="preset">
+          <option value="hill">Single hill</option>
+          <option value="ridge">Broad ridge</option>
+          <option value="two">Two hills</option>
+          <option value="flat">Flat</option>
+        </select></label>
+      <p class="hint">Drag across the view to draw the ground: the terrain follows your pointer.</p>
+      <label class="field">Wind speed <span class="val" id="v-wind"></span>
+        <input type="range" id="wind" min="0" max="0.4" step="0.01" value="0.15"></label>
+      <p class="hint">In units of the sound speed. The wind blows uniformly from the left.</p>
+      <label class="field">Stratification <span class="val" id="v-grav"></span>
+        <input type="range" id="grav" min="0.2" max="1" step="0.05" value="0.5"></label>
+      <p class="hint">Gravity g, which sets the buoyancy frequency N = 0.63 g and the scale height 0.71 / g of the isothermal atmosphere. Changing it or the wind restarts.</p>
+      <label class="field">Grid
+        <select id="grid">
+          <option value="193">193 × 65 (fast)</option>
+          <option value="385">385 × 129</option>
+          <option value="577">577 × 193 (detailed)</option>
+        </select></label>
+      <label class="field">Steps per frame <span class="val" id="v-spf"></span>
+        <input type="range" id="spf" min="1" max="30" step="1" value="10"></label>
+      <div class="row" style="margin-top:0.8rem">
+        <button id="btn-terrain" title="Restore the selected terrain">Reset terrain</button>
+      </div>
+    </div>
+  </aside>
+</div>
+
+<dialog id="about">
+  <h2>Stratus</h2>
+  <p>Compressible Euler equations with gravity (ideal gas, γ = 1.4) solved on your GPU with a WebGPU port of
+    <a href="https://github.com/conservation-laws/ryujin">ryujin</a>: continuous Q1 finite elements, graph viscosity with a
+    guaranteed maximum wave speed, an entropy-viscosity indicator, convex limiting of density and specific entropy, and
+    third-order explicit Runge–Kutta. Single precision.</p>
+  <p>Gravity enters by Strang splitting: half a step of the source, a full Runge–Kutta step of the Euler equations, and
+    another half step of the source. The source step is solved exactly (it changes momentum and total energy but not
+    density or internal energy). An atmosphere at rest is not automatically at rest for the discrete scheme, so it is
+    made so: one step is applied to the undisturbed atmosphere, and the resulting drift is subtracted from every step.
+    The undisturbed atmosphere then stays exactly as it is, and only the terrain disturbs the wind.</p>
+  <p>The atmosphere is isothermal (sound speed 1) with a uniform wind. Layers at the top, the inflow and the outflow
+    damp the flow toward it, so gravity waves leave the domain instead of reflecting. The terrain is masked out of
+    a fixed grid; the wind slips along it.</p>
+  <h3>Keyboard</h3>
+  <dl class="keys">
+    <dt>Space</dt><dd>Pause or resume</dd>
+    <dt>R</dt><dd>Restart from the undisturbed atmosphere</dd>
+    <dt>1 / 2 / 3</dt><dd>Potential temperature / vertical / horizontal wind</dd>
+    <dt>L</dt><dd>Isentropes on or off</dd>
+    <dt>?</dt><dd>This dialog</dd>
+  </dl>
+  <form method="dialog"><button class="primary">Close</button></form>
+</dialog>
+<script>if ("serviceWorker" in navigator && location.protocol === "https:") navigator.serviceWorker.register("sw.js");</script>
+</body>
+</html>

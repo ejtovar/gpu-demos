@@ -61,6 +61,22 @@ const runoff = (u, v) => {
   c = mix(c, [0.85, 0.92, 1.0], rain);
   return c;
 };
+const stratus = (u, v) => {
+  /* potential temperature bands (blue below, warm above) bent into lee waves over a mountain */
+  const hx = 0.36, m = 0.30 * Math.exp(-Math.pow((u - hx) / 0.13, 2));
+  const wave = (y) => 0.07 * Math.exp(-Math.pow((y - 0.55) / 0.35, 2)) * Math.sin(10 * (u - hx) - 6 * y) * sstep(0.1, 0.35, u);
+  const th = v - m * Math.exp(-2.5 * v) + wave(v);
+  const pal = [[0.11, 0.17, 0.36], [0.16, 0.45, 0.58], [0.55, 0.72, 0.62], [0.93, 0.80, 0.52], [0.89, 0.45, 0.22]];
+  const t = Math.min(0.999, Math.max(0, th)) * 4, k = Math.floor(t);
+  let c = mix(pal[k], pal[k + 1], t - k);
+  /* isentropes */
+  const line = Math.abs(((th * 9) % 1 + 1) % 1 - 0.5);
+  c = mix(c, [0.97, 0.97, 0.95], 0.55 * sstep(0.42, 0.48, line));
+  /* mountain */
+  const ground = 0.12 + m;
+  c = mix(c, mix([0.33, 0.29, 0.24], [0.55, 0.50, 0.38], sstep(ground - 0.06, ground, v)), sstep(ground + 0.006, ground - 0.006, v));
+  return c;
+};
 function render(f, n) {
   const ss = 3, buf = Buffer.alloc(n * n * 4);
   for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) {
@@ -75,7 +91,7 @@ function render(f, n) {
   }
   return png(n, n, buf);
 }
-for (const [name, f] of [['supersonic', supersonic], ['runoff', runoff]]) {
+for (const [name, f] of [['supersonic', supersonic], ['runoff', runoff], ['stratus', stratus]]) {
   fs.mkdirSync(`docs/${name}`, { recursive: true });
   for (const n of [512, 192, 180]) fs.writeFileSync(`docs/${name}/icon-${n}.png`, render(f, n));
 }
